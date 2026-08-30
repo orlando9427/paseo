@@ -283,6 +283,18 @@ export const ru: TranslationResources = {
     tooManyMatches: "Слишком много совпадений — уточните запрос",
     hostLoadFailed: "{{host}}: не удалось загрузить историю",
     searchPlaceholder: "Поиск по истории",
+    openCode: {
+      title: "Доступно в OpenCode",
+      loading: "Загрузка сеансов OpenCode...",
+      loadFailed: "Не удалось загрузить сеансы OpenCode с {{host}}",
+      hostUnavailable: "Не удалось подключиться к {{host}} для сеансов OpenCode",
+      updateHost: "Обновите {{host}}, чтобы показать сеансы OpenCode",
+      openFailed: "Не удалось открыть этот сеанс OpenCode. Повторите попытку.",
+      actions: {
+        open: "Открыть",
+        opening: "Открытие...",
+      },
+    },
     actions: {
       loadMore: "Загрузить ещё",
       clearSearch: "Очистить поиск",

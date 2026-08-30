@@ -279,6 +279,18 @@ export const ar: TranslationResources = {
     tooManyMatches: "نتائج كثيرة جدًا — ضيّق نطاق البحث",
     hostLoadFailed: "{{host}}: تعذر تحميل السجل",
     searchPlaceholder: "البحث في السجل",
+    openCode: {
+      title: "متاحة في OpenCode",
+      loading: "جارٍ تحميل جلسات OpenCode...",
+      loadFailed: "تعذر تحميل جلسات OpenCode من {{host}}",
+      hostUnavailable: "تعذر الوصول إلى {{host}} لجلسات OpenCode",
+      updateHost: "حدّث {{host}} لعرض جلسات OpenCode",
+      openFailed: "تعذر فتح جلسة OpenCode هذه. حاول مرة أخرى.",
+      actions: {
+        open: "فتح",
+        opening: "جارٍ الفتح...",
+      },
+    },
     actions: {
       loadMore: "تحميل المزيد",
       clearSearch: "مسح البحث",

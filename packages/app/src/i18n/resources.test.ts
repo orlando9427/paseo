@@ -384,6 +384,9 @@ describe("translation resources", () => {
     expect(en.sessions.title).toBe("History");
     expect(en.sessions.empty).toBe("No sessions yet");
     expect(en.sessions.actions.loadMore).toBe("Load more");
+    expect(en.sessions.openCode.title).toBe("Available in OpenCode");
+    expect(en.sessions.openCode.actions.opening).toBe("Opening...");
+    expect(en.sessions.openCode.updateHost).toContain("{{host}}");
     expect(en.agentList.fallbackTitle).toBe("New session");
     expect(en.agentList.dateSections.today).toBe("Today");
     expect(en.agentList.dateSections.older).toBe("Older");

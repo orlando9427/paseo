@@ -280,6 +280,18 @@ export const ko: TranslationResources = {
     tooManyMatches: "일치 항목이 너무 많습니다 — 검색 범위를 좁히세요",
     hostLoadFailed: "{{host}}: 기록을 불러오지 못했습니다",
     searchPlaceholder: "기록 검색",
+    openCode: {
+      title: "OpenCode에서 사용 가능",
+      loading: "OpenCode 세션을 불러오는 중...",
+      loadFailed: "{{host}}에서 OpenCode 세션을 불러오지 못했습니다",
+      hostUnavailable: "OpenCode 세션을 위해 {{host}}에 연결할 수 없습니다",
+      updateHost: "OpenCode 세션을 표시하려면 {{host}}을 업데이트하세요",
+      openFailed: "이 OpenCode 세션을 열 수 없습니다. 다시 시도하세요.",
+      actions: {
+        open: "열기",
+        opening: "여는 중...",
+      },
+    },
     actions: {
       loadMore: "더 불러오기",
       clearSearch: "검색 지우기",

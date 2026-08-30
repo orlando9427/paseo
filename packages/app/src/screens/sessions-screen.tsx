@@ -2,7 +2,7 @@ import { useMemo, useState, useCallback, useEffect, type ReactElement } from "re
 import { View, Text } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
 import { router } from "expo-router";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import { ChevronLeft, Import } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -16,11 +16,20 @@ import { ALL_HOSTS_OPTION_ID } from "@/components/hosts/host-picker";
 import { type AgentHistoryHostError, useAgentHistory } from "@/hooks/use-agent-history";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useImportSession } from "@/hooks/use-import-session";
-import { useHosts } from "@/runtime/host-runtime";
+import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
 import { buildOpenProjectRoute } from "@/utils/host-routes";
+import { type Theme } from "@/styles/theme";
+import { RecentOpenCodeSessionsSection } from "@/recent-opencode-sessions/section";
+import {
+  openRecentOpenCodeSession,
+  useRecentOpenCodeSessions,
+} from "@/recent-opencode-sessions/query";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
 
 /** Long enough that a typed word is one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 200;
+const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
+const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 
 const sessionsHostOptionTestID = (serverId: string) => `sessions-host-filter-item-${serverId}`;
 
@@ -71,7 +80,6 @@ export function SessionsScreen() {
 }
 
 function SessionsScreenContent() {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const importSession = useImportSession();
   const hosts = useHosts();
@@ -95,6 +103,16 @@ function SessionsScreenContent() {
     search,
   });
   const isSearching = isSearchSupported && search.length > 0;
+  const showOpenCodeSessions = searchInput.trim().length === 0;
+  const {
+    sessions: recentOpenCodeSessions,
+    errors: recentOpenCodeErrors,
+    isLoading: isLoadingRecentOpenCode,
+    refresh: refreshRecentOpenCode,
+  } = useRecentOpenCodeSessions({
+    serverId: historyServerId,
+    enabled: showOpenCodeSessions,
+  });
 
   useEffect(() => {
     if (
@@ -107,10 +125,14 @@ function SessionsScreenContent() {
 
   const [isManualRefresh, setIsManualRefresh] = useState(false);
 
+  const refreshSessions = useCallback(async () => {
+    await Promise.allSettled([refreshAll(), refreshRecentOpenCode()]);
+  }, [refreshAll, refreshRecentOpenCode]);
+
   const handleRefresh = useCallback(() => {
     setIsManualRefresh(true);
-    void refreshAll().finally(() => setIsManualRefresh(false));
-  }, [refreshAll]);
+    void refreshSessions().finally(() => setIsManualRefresh(false));
+  }, [refreshSessions]);
 
   // Searching filters the chronological history without changing its date buckets.
   const emptyText = resolveEmptyText({
@@ -127,6 +149,81 @@ function SessionsScreenContent() {
   }, []);
 
   const handleClearSearch = useCallback(() => setSearchInput(""), []);
+
+  const handleOpenCodeSession = useCallback(
+    async (session: Parameters<typeof openRecentOpenCodeSession>[0]["session"]) => {
+      await openRecentOpenCodeSession({
+        session,
+        getClient: (serverId) => getHostRuntimeStore().getClient(serverId),
+        navigate: navigateToAgent,
+      });
+    },
+    [],
+  );
+
+  const openCodeSection = useMemo(
+    () =>
+      showOpenCodeSessions ? (
+        <RecentOpenCodeSessionsSection
+          sessions={recentOpenCodeSessions}
+          errors={recentOpenCodeErrors}
+          isLoading={isLoadingRecentOpenCode}
+          showHost={selectedHost === ALL_HOSTS_OPTION_ID && hosts.length > 1}
+          onOpen={handleOpenCodeSession}
+        />
+      ) : null,
+    [
+      handleOpenCodeSession,
+      hosts.length,
+      isLoadingRecentOpenCode,
+      recentOpenCodeErrors,
+      recentOpenCodeSessions,
+      selectedHost,
+      showOpenCodeSessions,
+    ],
+  );
+  const hasOpenCodeStatus =
+    showOpenCodeSessions &&
+    (isLoadingRecentOpenCode ||
+      recentOpenCodeSessions.length > 0 ||
+      recentOpenCodeErrors.length > 0);
+
+  const listEmptyComponent = useMemo(() => {
+    if (showLoadError) {
+      return (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyText}>Unable to load sessions</Text>
+          <Button variant="ghost" onPress={handleRefresh}>
+            Try again
+          </Button>
+        </View>
+      );
+    }
+    if (hasOpenCodeStatus) return null;
+    return (
+      <View style={styles.emptyContainer} testID="sessions-empty">
+        <Text style={styles.emptyText}>{emptyText}</Text>
+        {isSearching ? (
+          <Button variant="ghost" onPress={handleClearSearch}>
+            {t("sessions.actions.clearSearch")}
+          </Button>
+        ) : (
+          <Button variant="ghost" leftIcon={ChevronLeft} onPress={handleBack}>
+            Back
+          </Button>
+        )}
+      </View>
+    );
+  }, [
+    emptyText,
+    handleBack,
+    handleClearSearch,
+    handleRefresh,
+    hasOpenCodeStatus,
+    isSearching,
+    showLoadError,
+    t,
+  ]);
 
   const listFooterComponent = useMemo(() => {
     // COMPAT(historyPagination): old daemons return a truncated relevance page.
@@ -179,41 +276,18 @@ function SessionsScreenContent() {
       {hostErrors.length > 0 ? <SessionHostErrorsBanner errors={hostErrors} t={t} /> : null}
       {isInitialLoad ? (
         <View style={styles.loadingContainer}>
-          <LoadingSpinner size="large" color={theme.colors.foregroundMuted} />
+          <ThemedLoadingSpinner size="large" uniProps={mutedColorMapping} />
         </View>
       ) : null}
-      {!isInitialLoad && showLoadError ? (
-        <View style={styles.emptyContainer}>
-          <Text style={styles.emptyText}>Unable to load sessions</Text>
-          <Button variant="ghost" onPress={handleRefresh}>
-            Try again
-          </Button>
-        </View>
-      ) : null}
-      {!isInitialLoad && !showLoadError && agents.length === 0 ? (
-        <View style={styles.emptyContainer} testID="sessions-empty">
-          <Text style={styles.emptyText}>{emptyText}</Text>
-          {isSearching ? (
-            <Button variant="ghost" onPress={handleClearSearch}>
-              {t("sessions.actions.clearSearch")}
-            </Button>
-          ) : (
-            <Button variant="ghost" leftIcon={ChevronLeft} onPress={handleBack}>
-              Back
-            </Button>
-          )}
-          <Button variant="ghost" leftIcon={Import} onPress={importSession.open}>
-            {t("importSession.title")}
-          </Button>
-        </View>
-      ) : null}
-      {!isInitialLoad && !showLoadError && agents.length > 0 ? (
+      {!isInitialLoad ? (
         <AgentList
           agents={agents}
           showCheckoutInfo={false}
           isRefreshing={isManualRefresh}
           onRefresh={handleRefresh}
           listFooterComponent={listFooterComponent}
+          listHeaderComponent={openCodeSection}
+          listEmptyComponent={listEmptyComponent}
           showAttentionIndicator={false}
           showHostColumn
           search={isSearching ? search : undefined}

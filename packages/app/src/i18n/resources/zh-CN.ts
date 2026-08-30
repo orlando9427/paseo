@@ -279,6 +279,18 @@ export const zhCN: TranslationResources = {
     tooManyMatches: "匹配过多 — 请缩小搜索范围",
     hostLoadFailed: "{{host}}：无法加载历史",
     searchPlaceholder: "搜索历史",
+    openCode: {
+      title: "OpenCode 中可用",
+      loading: "正在加载 OpenCode 会话...",
+      loadFailed: "无法从 {{host}} 加载 OpenCode 会话",
+      hostUnavailable: "无法连接 {{host}} 以获取 OpenCode 会话",
+      updateHost: "请更新 {{host}} 以显示 OpenCode 会话",
+      openFailed: "无法打开此 OpenCode 会话。请重试。",
+      actions: {
+        open: "打开",
+        opening: "正在打开...",
+      },
+    },
     actions: {
       loadMore: "加载更多",
       clearSearch: "清除搜索",

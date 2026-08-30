@@ -276,6 +276,18 @@ export const en = {
     tooManyMatches: "Too many matches — narrow your search",
     hostLoadFailed: "{{host}}: Could not load history",
     searchPlaceholder: "Search history",
+    openCode: {
+      title: "Available in OpenCode",
+      loading: "Loading OpenCode sessions...",
+      loadFailed: "Unable to load OpenCode sessions from {{host}}",
+      hostUnavailable: "Unable to reach {{host}} for OpenCode sessions",
+      updateHost: "Update {{host}} to show OpenCode sessions",
+      openFailed: "Unable to open this OpenCode session. Try again.",
+      actions: {
+        open: "Open",
+        opening: "Opening...",
+      },
+    },
     actions: {
       loadMore: "Load more",
       clearSearch: "Clear search",

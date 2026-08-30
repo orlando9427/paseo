@@ -284,6 +284,18 @@ export const es: TranslationResources = {
     tooManyMatches: "Demasiadas coincidencias: acota la búsqueda",
     hostLoadFailed: "{{host}}: No se pudo cargar el historial",
     searchPlaceholder: "Buscar en el historial",
+    openCode: {
+      title: "Disponible en OpenCode",
+      loading: "Cargando sesiones de OpenCode...",
+      loadFailed: "No se pudieron cargar las sesiones de OpenCode desde {{host}}",
+      hostUnavailable: "No se puede acceder a {{host}} para las sesiones de OpenCode",
+      updateHost: "Actualiza {{host}} para mostrar las sesiones de OpenCode",
+      openFailed: "No se pudo abrir esta sesión de OpenCode. Inténtalo de nuevo.",
+      actions: {
+        open: "Abrir",
+        opening: "Abriendo...",
+      },
+    },
     actions: {
       loadMore: "Cargar más",
       clearSearch: "Borrar búsqueda",

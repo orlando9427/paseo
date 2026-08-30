@@ -285,6 +285,18 @@ export const fr: TranslationResources = {
     tooManyMatches: "Trop de résultats — affinez la recherche",
     hostLoadFailed: "{{host}} : Impossible de charger l'historique",
     searchPlaceholder: "Rechercher dans l'historique",
+    openCode: {
+      title: "Disponible dans OpenCode",
+      loading: "Chargement des sessions OpenCode...",
+      loadFailed: "Impossible de charger les sessions OpenCode depuis {{host}}",
+      hostUnavailable: "Impossible de joindre {{host}} pour les sessions OpenCode",
+      updateHost: "Mettez à jour {{host}} pour afficher les sessions OpenCode",
+      openFailed: "Impossible d'ouvrir cette session OpenCode. Réessayez.",
+      actions: {
+        open: "Ouvrir",
+        opening: "Ouverture...",
+      },
+    },
     actions: {
       loadMore: "Charger plus",
       clearSearch: "Effacer la recherche",

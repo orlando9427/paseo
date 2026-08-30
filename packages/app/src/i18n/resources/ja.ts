@@ -284,6 +284,18 @@ export const ja: TranslationResources = {
     tooManyMatches: "一致が多すぎます — 検索条件を絞ってください",
     hostLoadFailed: "{{host}}: 履歴を読み込めませんでした",
     searchPlaceholder: "履歴を検索",
+    openCode: {
+      title: "OpenCode で利用可能",
+      loading: "OpenCode セッションを読み込んでいます...",
+      loadFailed: "{{host}} から OpenCode セッションを読み込めませんでした",
+      hostUnavailable: "OpenCode セッション用の {{host}} に接続できません",
+      updateHost: "OpenCode セッションを表示するには {{host}} を更新してください",
+      openFailed: "この OpenCode セッションを開けませんでした。もう一度お試しください。",
+      actions: {
+        open: "開く",
+        opening: "開いています...",
+      },
+    },
     actions: {
       loadMore: "さらに読み込む",
       clearSearch: "検索をクリア",

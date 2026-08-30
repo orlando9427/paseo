@@ -33,6 +33,8 @@ interface AgentListProps {
   selectedAgentId?: string;
   onAgentSelect?: () => void;
   listFooterComponent?: ReactElement | null;
+  listHeaderComponent?: ReactElement | null;
+  listEmptyComponent?: ReactElement | null;
   showAttentionIndicator?: boolean;
   showHostColumn?: boolean;
   search?: string;
@@ -337,6 +339,8 @@ export function AgentList({
   selectedAgentId,
   onAgentSelect,
   listFooterComponent,
+  listHeaderComponent,
+  listEmptyComponent,
   showAttentionIndicator = true,
   showHostColumn = false,
   search,
@@ -496,12 +500,17 @@ export function AgentList({
       <FlatList
         data={flatItems}
         style={styles.list}
-        contentContainerStyle={styles.listContent}
+        contentContainerStyle={[
+          styles.listContent,
+          flatItems.length === 0 && styles.emptyListContent,
+        ]}
         keyExtractor={keyExtractor}
         renderItem={renderItem}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
         ListFooterComponent={listFooterComponent}
+        ListHeaderComponent={listHeaderComponent}
+        ListEmptyComponent={listEmptyComponent}
         refreshControl={refreshControl}
       />
 
@@ -557,6 +566,9 @@ const styles = StyleSheet.create((theme) => ({
     paddingTop: theme.spacing[4],
     paddingBottom: theme.spacing[6],
     gap: theme.spacing[1],
+  },
+  emptyListContent: {
+    flexGrow: 1,
   },
   sectionHeading: {
     marginTop: theme.spacing[2],

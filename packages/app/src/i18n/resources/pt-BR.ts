@@ -283,6 +283,18 @@ export const ptBR: TranslationResources = {
     tooManyMatches: "Muitos resultados — refine a busca",
     hostLoadFailed: "{{host}}: Não foi possível carregar o histórico",
     searchPlaceholder: "Buscar no histórico",
+    openCode: {
+      title: "Disponível no OpenCode",
+      loading: "Carregando sessões do OpenCode...",
+      loadFailed: "Não foi possível carregar sessões do OpenCode de {{host}}",
+      hostUnavailable: "Não foi possível acessar {{host}} para sessões do OpenCode",
+      updateHost: "Atualize {{host}} para mostrar sessões do OpenCode",
+      openFailed: "Não foi possível abrir esta sessão do OpenCode. Tente novamente.",
+      actions: {
+        open: "Abrir",
+        opening: "Abrindo...",
+      },
+    },
     actions: {
       loadMore: "Carregar mais",
       clearSearch: "Limpar busca",
