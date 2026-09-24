@@ -22,9 +22,21 @@ export const ProviderCommandSchema = z.discriminatedUnion("mode", [
   ProviderCommandReplaceSchema,
 ]);
 
+const ProviderServerUrlSchema = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      const protocol = new URL(value).protocol;
+      return protocol === "http:" || protocol === "https:";
+    },
+    { message: "Server URL must use http or https" },
+  );
+
 export const ProviderRuntimeSettingsSchema = z.object({
   command: ProviderCommandSchema.optional(),
   env: z.record(z.string(), z.string()).optional(),
+  serverUrl: ProviderServerUrlSchema.optional(),
   disallowedTools: z.array(z.string()).optional(),
 });
 
@@ -54,6 +66,7 @@ export const ProviderOverrideSchema = z.object({
   description: z.string().optional(),
   command: z.array(z.string().min(1)).min(1).optional(),
   env: z.record(z.string(), z.string()).optional(),
+  serverUrl: ProviderServerUrlSchema.optional(),
   params: z.record(z.string(), z.unknown()).optional(),
   models: z.array(ProviderProfileModelSchema).optional(),
   additionalModels: z.array(ProviderProfileModelSchema).optional(),

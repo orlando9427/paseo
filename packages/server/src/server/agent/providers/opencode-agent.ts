@@ -169,6 +169,7 @@ const OPENCODE_PERSISTED_SESSION_LIMIT = 200;
 const OPENCODE_PENDING_ABORT_START_TIMEOUT_MS = 10_000;
 const OPENCODE_CHILD_SESSION_HYDRATION_LIMIT = 100;
 const OPENCODE_STOP_STATUS_MAX_DELAY_MS = 1_000;
+const OPENCODE_EXTERNAL_HEALTH_TIMEOUT_MS = 2_000;
 
 function waitForOpenCodeStopProbe(delayMs: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(signal.reason);
@@ -1393,6 +1394,21 @@ function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }
   return createOpencodeClient(options satisfies OpencodeClientConfig & { directory: string });
 }
 
+async function isExternalOpenCodeServerAvailable(serverUrl: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENCODE_EXTERNAL_HEALTH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${serverUrl.replace(/\/+$/, "")}/global/health`, {
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export class OpenCodeAgentClient implements AgentClient {
   readonly provider = "opencode" as const;
   readonly capabilities: AgentCapabilityFlags;
@@ -1756,6 +1772,9 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
+    if (this.runtimeSettings?.serverUrl) {
+      return isExternalOpenCodeServerAvailable(this.runtimeSettings.serverUrl);
+    }
     const launch = await resolveProviderLaunch({
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: "opencode",
@@ -1769,6 +1788,16 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
+    if (this.runtimeSettings?.serverUrl) {
+      const serverUrl = this.runtimeSettings.serverUrl;
+      const healthy = await isExternalOpenCodeServerAvailable(serverUrl);
+      return {
+        diagnostic: formatProviderDiagnostic("OpenCode", [
+          { label: "Server URL", value: serverUrl },
+          { label: "Health check", value: healthy ? "OK" : "Unreachable" },
+        ]),
+      };
+    }
     try {
       const launch = await resolveProviderLaunch({
         commandConfig: this.runtimeSettings?.command,

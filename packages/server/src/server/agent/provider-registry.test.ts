@@ -601,6 +601,23 @@ test("built-in override applies env", () => {
   });
 });
 
+test("built-in override applies serverUrl", () => {
+  buildProviderRegistry(logger, {
+    providerOverrides: {
+      claude: {
+        serverUrl: "http://127.0.0.1:4096",
+      },
+    },
+  });
+
+  expect(mockState.constructorArgs.claude[0]).toEqual({
+    runtimeSettings: {
+      command: undefined,
+      serverUrl: "http://127.0.0.1:4096",
+    },
+  });
+});
+
 test("OMP is a disabled built-in backed by the real OMP adapter", async () => {
   const omp = new FakeOmp();
   const registry = buildProviderRegistry(logger, { ompRuntime: omp });

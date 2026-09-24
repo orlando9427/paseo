@@ -303,6 +303,46 @@ describe("OpenCodeServerManager generations", () => {
   });
 });
 
+describe("OpenCodeServerManager external server", () => {
+  test("attaches to a configured serverUrl instead of spawning a process", async () => {
+    const upstream = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.flushHeaders();
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Missing upstream address");
+    const serverUrl = `http://127.0.0.1:${address.port}`;
+
+    const manager = new OpenCodeServerManager({
+      logger: createTestLogger(),
+      runtimeSettings: { serverUrl },
+      portAllocator: () => Promise.reject(new Error("must not allocate a port")),
+      spawnServerProcess: () => {
+        throw new Error("must not spawn a process for an external server");
+      },
+    });
+
+    const current = await manager.acquireCurrent();
+    const fresh = await manager.acquireNew();
+    const dedicated = await manager.acquireDedicated({});
+
+    expect(current.server).toEqual({ port: address.port, url: serverUrl });
+    expect(fresh.server).toEqual({ port: address.port, url: serverUrl });
+    expect(dedicated.server).toEqual({ port: address.port, url: serverUrl });
+    expect(fresh.events).toBe(current.events);
+    expect(manager.acquireExisting(serverUrl)?.events).toBe(current.events);
+    expect(manager.acquireExisting("http://127.0.0.1:1")).toBeNull();
+
+    await current.release();
+    await fresh.release();
+    await dedicated.release();
+    await manager.shutdown();
+
+    upstream.close();
+  });
+});
+
 describe("OpenCodeServerManager managed process ledger", () => {
   test("records helper server starts and removes the record on process exit", async () => {
     const { manager, runtime } = createTestManager([4601]);

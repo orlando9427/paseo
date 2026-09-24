@@ -95,6 +95,8 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private readonly spawnServerProcess: OpenCodeServerProcessSpawner;
   private readonly createEventSource: OpenCodeEventConsumerFactory;
   private readonly decorateServerEnv?: (env: Record<string, string>) => Record<string, string>;
+  private readonly externalServerUrl?: string;
+  private externalServer: { url: string; events: OpenCodeEventConsumer } | null = null;
 
   constructor(options: OpenCodeServerManagerOptions) {
     this.logger = options.logger;
@@ -112,6 +114,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     this.createEventSource =
       options.createEventSource ?? ((input) => new OpenCodeEventConsumer(input));
     this.decorateServerEnv = options.decorateServerEnv;
+    this.externalServerUrl = options.runtimeSettings?.serverUrl
+      ? normalizeOpenCodeServerUrl(options.runtimeSettings.serverUrl)
+      : undefined;
   }
 
   static getInstance(
@@ -157,6 +162,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
   async acquireCurrent(signal?: AbortSignal): Promise<OpenCodeServerAcquisition> {
     signal?.throwIfAborted();
+    if (this.externalServerUrl) {
+      return this.acquireExternalServer();
+    }
     const server = await waitForServerAcquisition(this.getCurrentServer(), signal);
     signal?.throwIfAborted();
     return this.acquireServer(server);
@@ -164,12 +172,18 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
   async acquireNew(signal?: AbortSignal): Promise<OpenCodeServerAcquisition> {
     signal?.throwIfAborted();
+    if (this.externalServerUrl) {
+      return this.acquireExternalServer();
+    }
     const server = await waitForServerAcquisition(this.getNewServer(), signal);
     signal?.throwIfAborted();
     return this.acquireServer(server);
   }
 
   async acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition> {
+    if (this.externalServerUrl) {
+      return this.acquireExternalServer();
+    }
     const server = await this.startServer(env);
     server.retired = true;
     this.retiredServers.add(server);
@@ -184,6 +198,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   acquireExisting(url: string): OpenCodeServerAcquisition | null {
+    if (this.externalServerUrl) {
+      return url === this.externalServerUrl ? this.acquireExternalServer() : null;
+    }
     const server = this.findLiveServerByUrl(url);
     return server ? this.acquireServer(server) : null;
   }
@@ -202,6 +219,29 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       server.process.exitCode === null &&
       server.process.signalCode === null
     );
+  }
+
+  private acquireExternalServer(): OpenCodeServerAcquisition {
+    const url = this.externalServerUrl;
+    if (!url) {
+      throw new Error("OpenCode server manager has no external server URL configured");
+    }
+    if (!this.externalServer) {
+      this.externalServer = {
+        url,
+        // Never resolves: we don't own this process, so there is no exit to watch for.
+        events: this.createEventSource({
+          serverUrl: url,
+          processExit: new Promise(() => {}),
+          logger: this.logger,
+        }),
+      };
+    }
+    return {
+      server: { port: resolveOpenCodeServerPort(url), url },
+      events: this.externalServer.events,
+      release: async () => {},
+    };
   }
 
   private acquireServer(server: OpenCodeServerGeneration): OpenCodeServerAcquisition {
@@ -481,6 +521,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     await Promise.all(servers.map((server) => this.killServer(server)));
     this.currentServer = null;
     this.retiredServers.clear();
+    if (this.externalServer) {
+      await this.externalServer.events.close();
+      this.externalServer = null;
+    }
   }
 
   private async cleanupRetiredServers(): Promise<void> {
@@ -584,6 +628,22 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       this.logger.warn({ err: error, id }, "Failed to remove OpenCode helper process record");
     }
   }
+}
+
+function normalizeOpenCodeServerUrl(serverUrl: string): string {
+  const parsed = new URL(serverUrl);
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function resolveOpenCodeServerPort(serverUrl: string): number {
+  const parsed = new URL(serverUrl);
+  if (parsed.port) {
+    return Number(parsed.port);
+  }
+  return parsed.protocol === "https:" ? 443 : 80;
 }
 
 function generationLogContext(server: OpenCodeServerGeneration): Record<string, unknown> {

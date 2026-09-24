@@ -428,6 +428,24 @@ For other providers that keep Pi's `--mode rpc` API but write sessions somewhere
 
 This session directory is also import-only. Launching and resuming still go through the configured command, so this example resumes with `my-pi-fork --mode rpc --session <session-file>`. `params.rpcTimeoutMs` overrides the 60-second Pi control-plane RPC deadline.
 
+### Attach to an existing OpenCode server
+
+By default, Paseo starts and manages its own `opencode serve` process. To use an already-running unauthenticated OpenCode server instead, configure `serverUrl` on the built-in `opencode` provider:
+
+```json
+{
+  "agents": {
+    "providers": {
+      "opencode": {
+        "serverUrl": "http://127.0.0.1:4096"
+      }
+    }
+  }
+}
+```
+
+When `serverUrl` is set, Paseo attaches to that server and never spawns, rotates, or shuts it down. `isAvailable()` and diagnostics check `serverUrl`'s `/global/health` endpoint instead of resolving a local `opencode` binary — the machine running Paseo does not need OpenCode installed. The configured server must be able to access the same workspace paths that Paseo sends in OpenCode requests. Authenticated OpenCode servers are not supported by this option; it works with unauthenticated servers only.
+
 ---
 
 ## Disabling a provider
@@ -684,6 +702,7 @@ Every entry under `agents.providers` accepts these fields:
 | `description`      | `string`                  | No                | Short description shown in the UI                                  |
 | `command`          | `string[]`                | Yes (ACP only)    | Command to spawn the agent process                                 |
 | `env`              | `Record<string, string>`  | No                | Environment variables to set for the agent process                 |
+| `serverUrl`        | `string`                  | No                | Existing OpenCode server URL to attach to instead of spawning one  |
 | `params`           | `Record<string, unknown>` | No                | Provider-specific options such as `supportsMcpServers: false`      |
 | `models`           | `ProviderProfileModel[]`  | No                | Static model list (overrides runtime discovery)                    |
 | `additionalModels` | `ProviderProfileModel[]`  | No                | Static model additions (merged with runtime discovery or `models`) |
