@@ -1,0 +1,17 @@
+# Commits from the ryan fork remote reviewed and found unnecessary, one per line:
+#   <full sha> # reason
+# Generated/maintained by `npm run fork:diff` (see scripts/fork-diff.mjs).
+
+55c4950a0649cd006e3dc71d1e8fa9dcd6d5d417 # fix(opencode): include all-mode agents in mode picker — already implemented upstream (isSelectableOpenCodeAgent/mergeOpenCodeModes), and upstream's version also supports agent hex colors
+5d26c94a60f328163bf67e2c4f2849eead15794c # add OpenCode subagent timeline support — upstream independently built a more complete version (SubAgentDetailProps, parseSubAgentLog, resolveSubAgentFallbackHeader in tool-call-details.tsx)
+27a54e57ed0d79528c27d4c307d7456f7c1c08cb # Propagate filtered session listing failures — upstream's listImportableSessions already returns a providerErrors array per-provider, superseding this single-provider-throw approach
+b348be7cbe303888417e0bb8e99ddcb4eadb8152 # Document Reef service and fork upgrade workflow — host-specific ops docs (Tailscale IP, systemd unit, file paths) for the fork author's private server, not reusable
+a2548d0ed26aee1c89fffba6a27be789fec8b1cf # Support shared upload storage — part of the Reef-hosted external server setup, not applicable without running against that infrastructure
+fbf25ebc4ec8d1421d5b2c0165e10fb0a1ccf1e5 # Support authenticated external OpenCode servers — superseded in scope by ryan/opencode-external-server (099a9dbc9), itself deferred pending re-port against upstream's refactored OpenCodeServerManager
+0640dc0803cfc2bf10151edb36087b22372d07a3 # Isolate shared upload attempts — depends on the Reef shared-upload feature above
+916acb268d37142fabf6a033446b0a4ef763d2b6 # Document external attachment storage — docs for the Reef shared-upload feature above
+87a5f9aff88270fea57c6adf1cb794f0c2e3758e # Document external OpenCode session ownership — docs tied to the Reef external-server setup
+f4a53b92d57209de6ccbff070ba117981bd9e1d1 # support OpenCode session handoff in Paseo (ryan/main line) — superseded by the reef-inbox implementation (51a680cef + be68ebeed), which Ryan's own docs/reef-upgrades.md marks as the authoritative rewrite
+82b163c2bb14db2cd1fb383bbc408b6560766ca7 # chore: exclude local tickets from PR branch — only deletes Ryan's internal .tickets/*.md task files, no product code
+350a2acadadaf898854261bdc4b6764168da60fc # chore: exclude local tickets from PR branch — only deletes Ryan's internal .tickets/*.md task files, no product code
+c4d0821d5a6b053f1e5fde54cc3b231b6dbef177 # chore: exclude local tickets from PR branch — only deletes Ryan's internal .tickets/*.md task files, no product code
