@@ -1873,6 +1873,20 @@ test("normalizeConfig injects the provider default model while leaving mode omit
   expect(snapshot.config.modeId).toBeUndefined();
 });
 
+test("normalizeConfig leaves OpenCode model omitted so OpenCode applies its own default", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-opencode-default-test-"));
+  const manager = new AgentManager({
+    clients: { opencode: new TestAgentClient("opencode") },
+    logger,
+  });
+
+  const snapshot = await manager.createAgent({ provider: "opencode", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  expect(snapshot.config.model).toBeUndefined();
+});
+
 test("normalizeConfig leaves Claude mode omitted", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-claude-default-test-"));
   const manager = new AgentManager({

@@ -5057,7 +5057,11 @@ export class AgentManager {
       normalized.model = trimmed.length > 0 && trimmed !== "default" ? trimmed : undefined;
     }
 
-    const shouldResolveDefaultModel = options.resolveDefaultModel ?? true;
+    // OpenCode resolves its own default model from opencode.json when none is sent;
+    // the catalog has no reliable isDefault signal for it, so guessing here would
+    // silently override a project's configured default with an arbitrary model.
+    const shouldResolveDefaultModel =
+      (options.resolveDefaultModel ?? true) && normalized.provider !== "opencode";
     if (shouldResolveDefaultModel && !normalized.model) {
       const defaultModelId = await this.resolveDefaultModelId(normalized);
       if (defaultModelId) {
