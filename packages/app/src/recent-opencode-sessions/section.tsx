@@ -204,7 +204,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   errorText: {
     color: theme.colors.palette.red[300],
-    fontSize: theme.fontSize.xs,
+    fontSize: theme.fontSize.sm,
   },
   loadingRow: {
     alignItems: "center",
@@ -260,7 +260,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   activity: {
     color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.xs,
+    fontSize: theme.fontSize.sm,
   },
   preview: {
     color: theme.colors.foregroundMuted,
@@ -268,7 +268,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   metadata: {
     color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.xs,
+    fontSize: theme.fontSize.sm,
   },
   openLabel: {
     color: theme.colors.foregroundMuted,

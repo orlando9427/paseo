@@ -2,7 +2,7 @@ import { useMemo, useState, useCallback, useEffect, type ReactElement } from "re
 import { View, Text } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
 import { router } from "expo-router";
-import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { ChevronLeft, Import } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -212,6 +212,9 @@ function SessionsScreenContent() {
             Back
           </Button>
         )}
+        <Button variant="ghost" leftIcon={Import} onPress={importSession.open}>
+          {t("importSession.title")}
+        </Button>
       </View>
     );
   }, [
@@ -220,6 +223,7 @@ function SessionsScreenContent() {
     handleClearSearch,
     handleRefresh,
     hasOpenCodeStatus,
+    importSession.open,
     isSearching,
     showLoadError,
     t,
