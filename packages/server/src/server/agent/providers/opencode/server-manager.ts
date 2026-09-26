@@ -630,7 +630,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 }
 
-function normalizeOpenCodeServerUrl(serverUrl: string): string {
+export function normalizeOpenCodeServerUrl(serverUrl: string): string {
   const parsed = new URL(serverUrl);
   parsed.hash = "";
   parsed.search = "";

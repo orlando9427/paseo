@@ -21,6 +21,7 @@ import { z } from "zod";
 
 import {
   getAgentStreamEventTurnId,
+  AgentTurnAdmissionError,
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
@@ -76,6 +77,7 @@ import { withTimeout } from "../../../utils/promise-timeout.js";
 import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
+  normalizeOpenCodeServerUrl,
   OPENCODE_EVENT_STREAM_READY_TIMEOUT_MS,
   OpenCodeServerManager,
   OPENCODE_SERVER_STARTUP_TIMEOUT_MS,
@@ -90,6 +92,26 @@ import {
   type OpenCodeEventSourceInput,
 } from "./opencode/event-consumer.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
+import {
+  consumeOpenCodeEvents,
+  openCodeObservationTiming,
+  waitForOpenCodeObservation,
+  type OpenCodeObservationTiming,
+} from "./opencode/event-consumer.js";
+import type { OpenCodeHistorySink } from "./opencode/native-history.js";
+import { OpenCodeAdmission, createOpenCodeDispatchMessageId } from "./opencode/turn-admission.js";
+import {
+  OpenCodeSubmissionOutcomeError,
+  OPENCODE_SUBMISSION_RECEIPT_LIMIT,
+  restoreOpenCodeSubmissions,
+  type OpenCodeSubmissionReceipt,
+} from "./opencode/native-submissions.js";
+import {
+  externalOpenCodeSessionKey,
+  type ExternalOpenCodeSessionPage,
+  type ListExternalOpenCodeSessionsInput,
+} from "../external-opencode-types.js";
+import { collectExternalOpenCodeSessions } from "./opencode/external-session-metadata.js";
 import {
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
@@ -128,6 +150,7 @@ function formatOpenCodeEventStreamDiagnostics(diagnostics: OpenCodeEventStreamDi
 
 const OPENCODE_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
+  supportsAbortableTurnAdmission: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
   supportsDynamicModes: true,
@@ -1223,7 +1246,9 @@ async function readOpenCodeSessionMessagesFromSdk(
   );
 
   if (response.error || !response.data) {
-    return [];
+    throw new Error(
+      `Failed to read OpenCode history: ${toDiagnosticErrorMessage(response.error ?? "missing data")}`,
+    );
   }
 
   return filterOpenCodeRevertedMessages(response.data, session.revert);
@@ -1276,13 +1301,19 @@ function resolveOpenCodePersistedSessionModeId(
   session: OpenCodePersistedSession,
   messages: ReadonlyArray<OpenCodeSessionMessage>,
 ): string | undefined {
-  const agent = session.agent ?? messages.map(readOpenCodeMessageAgent).find(Boolean);
+  const agent = session.agent ?? readLatestOpenCodeSelection(messages)?.info.agent;
   return agent ? (normalizeOpenCodeModeId(agent) ?? undefined) : undefined;
 }
 
-function readOpenCodeMessageAgent(message: OpenCodeSessionMessage): string | undefined {
-  const agent = message.info.agent;
-  return typeof agent === "string" && agent.trim() ? agent : undefined;
+function readLatestOpenCodeSelection(
+  messages: ReadonlyArray<OpenCodeSessionMessage>,
+): OpenCodeSessionMessage | undefined {
+  // User selections express intent; internal compaction/assistant agents must not replace it.
+  return (
+    messages.findLast(
+      (message) => message.info.role === "user" && !findOpenCodeCompactionPart(message),
+    ) ?? messages.findLast((message) => !isOpenCodeCompactionSummaryMessage(message.info))
+  );
 }
 
 function resolveOpenCodePersistedSessionModel(
@@ -1293,7 +1324,8 @@ function resolveOpenCodePersistedSessionModel(
     return buildOpenCodeModelLookupKey(session.model.providerID, session.model.id);
   }
 
-  const model = messages.map(readOpenCodeMessageModel).find(Boolean);
+  const selection = readLatestOpenCodeSelection(messages);
+  const model = selection ? readOpenCodeMessageModel(selection) : undefined;
   return model ? buildOpenCodeModelLookupKey(model.providerID, model.modelID) : undefined;
 }
 
@@ -1319,8 +1351,14 @@ function buildOpenCodeReplayTimelineEvents(
   }
   if (info.role === "user") {
     const text = parts
-      .filter((part): part is Extract<OpenCodePart, { type: "text" }> => part.type === "text")
-      .map((part) => part.text)
+      .map((part) => {
+        if (part.type === "text") return part.text;
+        // User timeline rows are text-only in the existing wire contract. Keep the full native
+        // reference (including data URLs) so image/file-only messages remain usable on replay.
+        if (part.type === "file")
+          return `\n[${part.filename ?? "Attachment"}](${part.url})\nMIME: ${part.mime}\n`;
+        return "";
+      })
       .join("");
 
     return text
@@ -1381,6 +1419,7 @@ export const __openCodeInternals = {
 };
 
 interface OpenCodeAgentClientDeps {
+  observationTiming?: OpenCodeObservationTiming;
   serverManager?: OpenCodeServerManagerLike;
   createClient?: OpenCodeClientFactory;
   resolveHomeDir?: () => string;
@@ -1422,6 +1461,7 @@ export class OpenCodeAgentClient implements AgentClient {
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly modelContextWindows = new Map<string, number>();
   private readonly bridge?: OpenCodeBridge;
+  private readonly observationTiming: OpenCodeObservationTiming;
 
   constructor(
     logger: Logger,
@@ -1453,6 +1493,7 @@ export class OpenCodeAgentClient implements AgentClient {
           : undefined,
       });
     this.resolveHomeDir = deps.resolveHomeDir ?? resolveOpenCodeHomeDir;
+    this.observationTiming = deps.observationTiming ?? openCodeObservationTiming;
   }
 
   async createSession(
@@ -1513,8 +1554,10 @@ export class OpenCodeAgentClient implements AgentClient {
         options?.persistSession,
         launchContext?.agentId,
         url,
-        false,
+        this.runtimeSettings?.serverUrl !== undefined,
+        this.runtimeSettings?.serverUrl !== undefined,
         unbindBridge,
+        this.observationTiming,
       );
     } catch (error) {
       await acquisition.release();
@@ -1568,8 +1611,15 @@ export class OpenCodeAgentClient implements AgentClient {
         undefined,
         launchContext?.agentId,
         url,
-        registeredAcquisition !== null,
+        registeredAcquisition !== null || this.runtimeSettings?.serverUrl !== undefined,
+        this.runtimeSettings?.serverUrl !== undefined,
         unbindBridge,
+        this.observationTiming,
+        restoreOpenCodeSubmissions(
+          handle.metadata?.openCodeNativeSubmissions,
+          url,
+          handle.sessionId,
+        ),
       );
     } catch (error) {
       await acquisition.release();
@@ -1686,6 +1736,32 @@ export class OpenCodeAgentClient implements AgentClient {
 
     try {
       return await collectOpenCodeImportableSessionsFromSdk(client, options);
+    } finally {
+      await acquisition.release();
+    }
+  }
+
+  async listExternalOpenCodeSessions(
+    input: ListExternalOpenCodeSessionsInput,
+  ): Promise<ExternalOpenCodeSessionPage> {
+    input.signal?.throwIfAborted();
+    if (!this.runtimeSettings?.serverUrl)
+      throw new Error("External OpenCode discovery requires an explicitly configured serverUrl");
+    const endpoint = externalOpenCodeSessionKey(this.runtimeSettings.serverUrl, "").slice(0, -1);
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(30_000),
+      ...(input.signal ? [input.signal] : []),
+    ]);
+    const acquisition = await this.serverManager.acquireCurrent(signal);
+    try {
+      signal.throwIfAborted();
+      if (externalOpenCodeSessionKey(acquisition.server.url, "").slice(0, -1) !== endpoint)
+        throw new Error("External OpenCode discovery endpoint changed");
+      const client = this.createOpenCodeClient({
+        baseUrl: endpoint,
+        directory: input.cwd,
+      });
+      return await collectExternalOpenCodeSessions({ client, endpoint, input, signal });
     } finally {
       await acquisition.release();
     }
@@ -2057,8 +2133,11 @@ function stringifyStructuredAssistantMessage(value: unknown): string | null {
 async function listOpenCodeCommandsFromSdk(
   client: Pick<OpencodeClient, "command">,
   directory: string,
+  signal?: AbortSignal,
 ): Promise<AgentSlashCommand[]> {
-  const result = await client.command.list({ directory });
+  signal?.throwIfAborted();
+  const result = await client.command.list({ directory }, { signal });
+  signal?.throwIfAborted();
   const commandsByName = new Map(
     OPENCODE_HANDLED_BUILTIN_SLASH_COMMANDS.map((command) => [command.name, command]),
   );
@@ -3126,24 +3205,29 @@ function appendOpenCodeSessionError(
     return;
   }
   resetOpenCodeTurnTrackingState(state);
-  const error = event.properties.error;
+  events.push(toOpenCodeSessionErrorTerminal(event.properties.error));
+}
+
+function toOpenCodeSessionErrorTerminal(
+  error: Extract<OpenCodeEvent, { type: "session.error" }>["properties"]["error"],
+): TerminalTurnEvent {
   if (
     typeof error === "object" &&
     error !== null &&
     "name" in error &&
     error.name === "MessageAbortedError"
   ) {
-    events.push({
+    return {
       type: "turn_canceled",
       provider: "opencode",
       reason: "interrupted",
-    });
+    };
   } else {
-    events.push({
+    return {
       type: "turn_failed",
       provider: "opencode",
       error: toDiagnosticErrorMessage(error),
-    });
+    };
   }
 }
 
@@ -3213,10 +3297,21 @@ type OpenCodeRunnerStatus = "idle" | "busy" | "retry";
  * only once both the terminal and every issued abort have settled.
  */
 interface OpenCodeStop {
+  readonly ownerTurnId: string | null;
   /** Foreground turn still owed a cancellation acknowledgement; cleared once emitted. */
   pendingCancellationTurnId: string | null;
   /** Resolves when the canceled run publishes its authoritative terminal. */
   readonly terminal: Deferred<void>;
+}
+
+interface OpenCodeNativeTurn {
+  turnId: string;
+  messageId: string | null;
+  accepted: Deferred<void>;
+  requestAcknowledged: boolean;
+  terminalObserved: boolean;
+  submission: OpenCodeSubmissionReceipt | null;
+  submissionError?: { cause: unknown };
 }
 
 function unwrapOpenCodeGlobalEvent(event: unknown): OpenCodeEvent | null {
@@ -3354,7 +3449,7 @@ async function listOpenCodeChildSessions(
 
 class OpenCodeAgentSession implements AgentSession {
   readonly provider = "opencode" as const;
-  readonly capabilities = OPENCODE_CAPABILITIES;
+  readonly capabilities: AgentCapabilityFlags;
 
   private readonly config: OpenCodeAgentConfig;
   private readonly client: OpencodeClient;
@@ -3365,6 +3460,12 @@ class OpenCodeAgentSession implements AgentSession {
   private autoAcceptEnabled = false;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private abortController: AbortController | null = null;
+  private pendingTurnAdmission: OpenCodeAdmission | null = null;
+  private readonly nativeRequestControllers = new Set<AbortController>();
+  private fencedNativeTurn: OpenCodeNativeTurn | null = null;
+  private readonly nativeSubmissions = new Map<string, OpenCodeSubmissionReceipt>();
+  private dispatchGeneration = 0;
+  private readonly assistantParents = new Map<string, string>();
   private accumulatedUsage: AgentUsage = {};
   private sessionTotalCostUsd: number | undefined;
   private mcpConfigured = false;
@@ -3373,6 +3474,7 @@ class OpenCodeAgentSession implements AgentSession {
   private pendingUserMessageText: string | null = null;
   private pendingClientMessageId: string | null = null;
   private pendingSteerSubmissions: OpenCodePendingSteerSubmission[] = [];
+  private readonly nativeClientMessageIds = new Map<string, string>();
   private emittedUserMessageIds = new Set<string>();
   private materializedParts = new Map<
     string,
@@ -3394,8 +3496,30 @@ class OpenCodeAgentSession implements AgentSession {
    * run, and a rejection means we never proved the runner stopped.
    */
   private abortSettlement: Promise<void> = Promise.resolve();
-  private externalStatusReconciliationStarted = false;
   private runnerStatusRevision = 0;
+  private connectionCount = 0;
+  private runnerRecoveryRequired = false;
+  private requestRevision = 0;
+  private historyRevision = 0;
+  private selectionRevision = 0;
+  private localSelectionChanged = false;
+  private selectionFingerprint: string | null = null;
+  private readonly observationAbort = new AbortController();
+  private observationTask: Promise<void> | null = null;
+  private cancelObservation: (() => void) | null = null;
+  private observationRetryMs = 100;
+  private eventStreamAbortController: AbortController | null = null;
+  private eventStreamReady: Deferred<void> | null = null;
+  private eventStreamTask: Promise<void> | null = null;
+  private requestsDirty = true;
+  private historyDirty = true;
+  private replaceNativeHistory: OpenCodeHistorySink | null = null;
+  private nativeHistoryAbort: AbortController | null = null;
+  private nativeHistoryFingerprint: string | null = null;
+  private readonly nativeRequestSubscribers = new Set<
+    (requests: readonly AgentPermissionRequest[]) => void
+  >();
+  private ingress: Promise<void> = Promise.resolve();
   private readonly runningToolCalls = new Map<string, ToolCallTimelineItem>();
   private subAgentsByCallId = new Map<string, OpenCodeSubAgentActivityState>();
   private subAgentCallIdByChildSessionId = new Map<string, string>();
@@ -3410,6 +3534,7 @@ class OpenCodeAgentSession implements AgentSession {
     string,
     Extract<Extract<AgentStreamEvent, { type: "provider_subagent" }>["event"], { type: "upsert" }>
   >();
+  private readonly observedChildSessionIds = new Set<string>();
   private readonly pendingPermissionDirectories = new Map<string, string>();
   private childHydrationPromise: Promise<void> | null = null;
   private childHydrationCompleted = false;
@@ -3417,7 +3542,6 @@ class OpenCodeAgentSession implements AgentSession {
   private selectedModelContextWindowMaxTokens: number | undefined;
   private releaseServer: (() => Promise<void>) | null;
   private releaseBridge: (() => void) | null;
-  private ingress = Promise.resolve();
   private gapRepairRevision = 0;
   private recoveryAbortController = new AbortController();
   private unsubscribeEvents: (() => void) | null = null;
@@ -3436,8 +3560,15 @@ class OpenCodeAgentSession implements AgentSession {
     private readonly agentId?: string,
     private readonly serverUrl?: string,
     private readonly externallyDriven = false,
+    private readonly externalServer = false,
     releaseBridge?: () => void,
+    private readonly observationTiming: OpenCodeObservationTiming = openCodeObservationTiming,
+    restoredSubmissions: OpenCodeSubmissionReceipt[] = [],
   ) {
+    this.capabilities = {
+      ...OPENCODE_CAPABILITIES,
+      supportsNativeHistoryObservation: externalServer,
+    };
     this.config = config;
     this.client = client;
     this.sessionId = sessionId;
@@ -3448,21 +3579,36 @@ class OpenCodeAgentSession implements AgentSession {
     this.releaseServer = releaseServer ?? null;
     this.releaseBridge = releaseBridge ?? null;
     this.persistSession = persistSession;
+    for (const receipt of restoredSubmissions) this.nativeSubmissions.set(receipt.id, receipt);
     this.selectedModelContextWindowMaxTokens = this.resolveConfiguredModelContextWindowMaxTokens(
       config.model,
     );
-    this.unsubscribeEvents = this.events.subscribe((input) => {
-      if ("type" in input && input.type === "server-exited")
-        this.recoveryAbortController.abort(input.error);
-      this.ingress = this.ingress
-        .then(() => this.consumeEventSourceInput(input))
-        .catch((error) => {
-          this.logger.warn(
-            { err: error, sessionId: this.sessionId },
-            "OpenCode event ingress failed",
-          );
-        });
-    });
+    // An external server's shared event bus delivers to every adapter attached to that same
+    // server, including one this manager already closed and replaced — a successor adapter has
+    // no way to tell a broadcast event apart from a stale one. `consumeEventStream` reads a
+    // per-adapter stream instead (started eagerly below, mirroring this same-tick subscription),
+    // so external sessions skip this shared subscription entirely rather than double-consuming.
+    if (externalServer) {
+      void this.ensureEventStreamReady().catch((error) => {
+        this.logger.warn(
+          { err: error, sessionId: this.sessionId },
+          "OpenCode event stream failed to start",
+        );
+      });
+    } else {
+      this.unsubscribeEvents = this.events.subscribe((input) => {
+        if ("type" in input && input.type === "server-exited")
+          this.recoveryAbortController.abort(input.error);
+        this.ingress = this.ingress
+          .then(() => this.consumeEventSourceInput(input))
+          .catch((error) => {
+            this.logger.warn(
+              { err: error, sessionId: this.sessionId },
+              "OpenCode event ingress failed",
+            );
+          });
+      });
+    }
   }
 
   get id(): string | null {
@@ -3478,15 +3624,32 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
+    return this.runtimeInfoSnapshot();
+  }
+
+  private runtimeInfoSnapshot(): AgentRuntimeInfo {
     return {
       provider: "opencode",
       sessionId: this.sessionId,
       model: this.config.model ?? null,
       modeId: this.currentMode,
+      ...(this.nativeSubmissions.size
+        ? { extra: { openCodeNativeSubmissions: this.getNativeSubmissions() } }
+        : {}),
     };
   }
 
+  private publishNativeRuntime(): void {
+    if (!this.replaceNativeHistory && this.nativeSubmissions.size === 0) return;
+    this.notifySubscribers(
+      { type: "model_changed", provider: "opencode", runtimeInfo: this.runtimeInfoSnapshot() },
+      null,
+    );
+  }
+
   async setModel(modelId: string | null): Promise<void> {
+    this.selectionRevision += 1;
+    this.localSelectionChanged = true;
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
     this.config.model = normalizedModelId ?? undefined;
@@ -3496,6 +3659,8 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
+    this.selectionRevision += 1;
+    this.localSelectionChanged = true;
     const normalizedThinkingOptionId = normalizeOpenCodeVariantId(thinkingOptionId);
     this.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
   }
@@ -3511,6 +3676,7 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
+    this.pendingTurnAdmission?.controller.abort(new Error("OpenCode turn admission interrupted"));
     const turnId = this.activeForegroundTurnId;
     this.abortController?.abort();
     const abort = this.issueStop(turnId);
@@ -3718,11 +3884,10 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
-  private async readProviderRunnerStatus(): Promise<OpenCodeRunnerStatus> {
-    const response = await this.client.session.status(
-      { directory: this.config.cwd },
-      { signal: this.recoveryAbortController.signal },
-    );
+  private async readProviderRunnerStatus(
+    signal: AbortSignal = this.recoveryAbortController.signal,
+  ): Promise<OpenCodeRunnerStatus> {
+    const response = await this.client.session.status({ directory: this.config.cwd }, { signal });
     if (response.error) {
       throw new Error(
         `Failed to confirm OpenCode session status: ${toDiagnosticErrorMessage(response.error)}`,
@@ -3752,16 +3917,75 @@ class OpenCodeAgentSession implements AgentSession {
       throw new Error("OpenCode session is closed");
     }
     if (this.turnState.status === "running") {
-      throw new Error("A foreground turn is already active");
+      throw new AgentTurnAdmissionError("not_sent", "A foreground turn is already active");
     }
+    // Every session goes through admission fencing, not only externally-owned ones: a managed
+    // session can otherwise deadlock starting a replacement turn while a prior stop is still in
+    // flight, since a plain wait for runner quiescence has no way to be interrupted early. The
+    // admission's own abort signal (revoked by `interrupt()` via `pendingTurnAdmission`) races
+    // that wait instead, so a second Stop can cancel a still-queued replacement immediately.
+    if (this.pendingTurnAdmission) throw new Error("OpenCode turn admission is already pending");
+    const admission = new OpenCodeAdmission(options?.admission, () => {
+      if (this.closed) throw new Error("OpenCode session is closed");
+      if (this.pendingTurnAdmission !== admission) throw new Error("Stale OpenCode turn admission");
+    });
+    this.pendingTurnAdmission = admission;
     try {
-      await this.awaitRunnerQuiescence();
+      admission.assertCurrent();
+      const result = await this.startAdmittedTurn(prompt, options, admission);
+      admission.assertCurrent();
+      return result;
     } catch (error) {
-      this.rethrowRunnerWaitError(error);
+      this.discardUnsubmittedAdmission(admission);
+      if (!admission.submitted && admission.submissionId)
+        this.nativeSubmissions.delete(admission.submissionId);
+      const receipt = admission.submissionId
+        ? this.nativeSubmissions.get(admission.submissionId)
+        : undefined;
+      if (receipt) {
+        receipt.callerInterrupted = true;
+        this.publishNativeRuntime();
+        throw new OpenCodeSubmissionOutcomeError(error, receipt);
+      }
+      if (
+        error instanceof OpenCodeSubmissionOutcomeError ||
+        error instanceof AgentTurnAdmissionError
+      )
+        throw error;
+      if (admission.fence)
+        throw new AgentTurnAdmissionError("not_sent", toDiagnosticErrorMessage(error), {
+          cause: error,
+        });
+      throw error;
+    } finally {
+      if (this.pendingTurnAdmission === admission) this.pendingTurnAdmission = null;
     }
-    if (this.closed) {
-      throw new Error("OpenCode session is closed");
-    }
+  }
+
+  private async startAdmittedTurn(
+    prompt: AgentPromptInput,
+    options: AgentRunOptions | undefined,
+    admission: OpenCodeAdmission,
+  ): Promise<{ turnId: string }> {
+    await admission.wait(this.awaitRunnerQuiescence());
+    await admission.wait(this.resolvePriorNativeSubmissions());
+    await admission.wait(this.ensureMcpServersConfigured(admission.signal));
+    // A managed session's live stream is the shared event bus subscribed at construction; only
+    // an external session's isolated `consumeEventStream` needs starting here.
+    await admission.wait(
+      this.externalServer ? this.ensureEventStreamReady() : this.awaitSharedEventStreamReady(),
+    );
+    const slashCommand = await admission.wait(
+      this.resolveSlashCommandInvocation(prompt, admission.signal),
+    );
+    // Only an external session needs this barrier: it races a new turn against native events
+    // reflecting a stale/interrupted one, observed through the isolated stream started above. A
+    // managed session's ingress can include a slow, unrelated gap-repair retry (its shared bus
+    // subscription is independent of turn dispatch), so waiting for it here would block a new
+    // turn on event processing that has nothing to do with it.
+    if (this.externalServer) await admission.wait(this.drainOpenCodeIngress());
+    await this.assertExternalRunnerIdle(admission);
+    admission.assertCurrent();
     if (this.turnState.status !== "idle") {
       throw new Error("OpenCode is still stopping the previous turn");
     }
@@ -3769,9 +3993,7 @@ class OpenCodeAgentSession implements AgentSession {
     this.runningToolCalls.clear();
     this.subAgentsByCallId.clear();
     this.subAgentCallIdByChildSessionId.clear();
-    const turnAbortController = new AbortController();
-    this.abortController = turnAbortController;
-    await this.ensureMcpServersConfigured();
+    this.abortController = admission.controller;
     const contextWindowMaxTokens = this.resolveSelectedModelContextWindowMaxTokens();
     this.accumulatedUsage = contextWindowMaxTokens !== undefined ? { contextWindowMaxTokens } : {};
 
@@ -3782,131 +4004,81 @@ class OpenCodeAgentSession implements AgentSession {
     const model = this.parseModel(this.config.model);
     const thinkingOptionId = this.config.thinkingOptionId;
     const effectiveVariant = thinkingOptionId ?? undefined;
-    const effectiveMode = resolveOpenCodeRuntimeAgentId(this.currentMode);
-
-    await this.awaitEventStreamReady(turnAbortController);
+    const effectiveMode = resolveOpenCodeRuntimeAgentId(admission.modeId ?? this.currentMode);
 
     const turnId = this.createTurnId();
-    this.materializedParts.clear();
+    admission.turnId = turnId;
+    const compact =
+      slashCommand?.commandName === "compact" || slashCommand?.commandName === "summarize";
+    const nativeTurn: OpenCodeNativeTurn | null = admission.fence
+      ? {
+          turnId,
+          messageId: compact ? null : createOpenCodeDispatchMessageId(),
+          accepted: createDeferred<void>(),
+          requestAcknowledged: false,
+          terminalObserved: false,
+          submission: null,
+        }
+      : null;
+    this.fencedNativeTurn = nativeTurn;
+    this.rememberNativeClientMessage(nativeTurn);
+    // A managed session has no native-turn identity of its own; upstream's gap-repair
+    // reconciliation (reconcileAfterGap) needs one to find this turn's message boundary after a
+    // reconnect, so track it the same way the old fire-and-forget dispatch used to.
+    let dispatchMessageId: string | null;
+    if (nativeTurn) {
+      dispatchMessageId = nativeTurn.messageId;
+    } else {
+      dispatchMessageId = compact ? null : createOpenCodeMessageId();
+      this.activeDispatchMessageId = dispatchMessageId;
+    }
+    this.dispatchGeneration += 1;
     this.turnState = { status: "running", turnId };
     this.notifySubscribers({ type: "turn_started", provider: "opencode" }, turnId);
-
-    const slashCommand = await this.resolveSlashCommandInvocation(prompt);
-    if (slashCommand) {
-      if (slashCommand.commandName === "compact" || slashCommand.commandName === "summarize") {
-        this.activeDispatchMessageId = null;
-        this.suppressAssistantMessagesUntilIdle.active = true;
-        void this.client.session
-          .summarize({
+    admission.assertCurrent();
+    let submission: Promise<void>;
+    if (compact) {
+      this.suppressAssistantMessagesUntilIdle.active = true;
+      submission = this.submitNativeTurn(admission, nativeTurn, "compact", () =>
+        this.client.session.summarize(
+          {
             sessionID: this.sessionId,
             directory: this.config.cwd,
             ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
-          })
-          .then((response) => {
-            if (response.error) {
-              this.suppressAssistantMessagesUntilIdle.active = false;
-              this.finishForegroundTurn(
-                {
-                  type: "turn_failed",
-                  provider: "opencode",
-                  error: toDiagnosticErrorMessage(response.error),
-                },
-                turnId,
-              );
-            }
-            return;
-          })
-          .catch((error) => {
-            this.suppressAssistantMessagesUntilIdle.active = false;
-            this.finishForegroundTurn(
-              {
-                type: "turn_failed",
-                provider: "opencode",
-                error: toDiagnosticErrorMessage(error),
-              },
-              turnId,
-            );
-          });
-        return { turnId };
-      }
-
-      // command() is only dispatch acknowledgement. OpenCode session events are
-      // the source of truth for when the command turn becomes idle or fails.
-      this.activeDispatchMessageId = createOpenCodeMessageId();
-      void this.client.session
-        .command({
-          sessionID: this.sessionId,
-          directory: this.config.cwd,
-          command: slashCommand.commandName,
-          arguments: slashCommand.args ?? "",
-          messageID: this.activeDispatchMessageId,
-          ...(this.config.model ? { model: this.config.model } : {}),
-          ...(effectiveMode ? { agent: effectiveMode } : {}),
-          ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-        })
-        .then((response) => {
-          if (response.error) {
-            if (isOpenCodeHeadersTimeoutFailure(response.error)) {
-              this.logger.warn(
-                {
-                  err: response.error,
-                  commandName: slashCommand.commandName,
-                  turnId,
-                },
-                "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
-              );
-              return;
-            }
-            const errorMsg = toDiagnosticErrorMessage(response.error);
-            this.finishForegroundTurn(
-              { type: "turn_failed", provider: "opencode", error: errorMsg },
-              turnId,
-            );
-          }
-          return;
-        })
-        .catch((err) => {
-          if (isOpenCodeHeadersTimeoutFailure(err)) {
-            this.logger.warn(
-              {
-                err,
-                commandName: slashCommand.commandName,
-                turnId,
-              },
-              "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
-            );
-            return;
-          }
-          this.finishForegroundTurn(
-            { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(err) },
-            turnId,
-          );
-        });
-    } else {
-      const dispatchMessageId = createOpenCodeMessageId();
-      this.activeDispatchMessageId = dispatchMessageId;
-      // Wrap in an async IIFE so a synchronous throw from promptAsync (e.g.
-      // SDK input validation) is caught alongside async rejections. A plain
-      // `.then().catch()` chain would let a sync throw escape unhandled.
-      void (async () => {
-        this.traceOpenCode("provider.opencode.prompt_async.start", {
-          turnId,
-          sessionId: this.sessionId,
-          model,
-          effectiveMode,
-          effectiveVariant,
-          partTypes: parts.map((p) => p.type),
-        });
-        try {
-          const systemPrompt = composeSystemPromptParts(
-            this.config.systemPrompt,
-            this.config.daemonAppendSystemPrompt,
-          );
-          const promptResponse = await this.client.session.promptAsync({
+          },
+          { signal: admission.signal },
+        ),
+      );
+    } else if (slashCommand) {
+      submission = this.submitNativeTurn(admission, nativeTurn, "command", () =>
+        this.client.session.command(
+          {
             sessionID: this.sessionId,
             directory: this.config.cwd,
-            messageID: dispatchMessageId,
+            command: slashCommand.commandName,
+            arguments: slashCommand.args ?? "",
+            ...(dispatchMessageId ? { messageID: dispatchMessageId } : {}),
+            ...(this.config.model ? { model: this.config.model } : {}),
+            ...(effectiveMode ? { agent: effectiveMode } : {}),
+            ...(effectiveVariant ? { variant: effectiveVariant } : {}),
+          },
+          { signal: admission.signal },
+        ),
+      );
+    } else {
+      // OpenCode stores permission rules on the session (set in createSession/resumeSession)
+      // rather than sending them with each prompt, which drops them.
+      const systemPrompt = composeSystemPromptParts(
+        this.config.systemPrompt,
+        this.config.daemonAppendSystemPrompt,
+      );
+      submission = this.submitNativeTurn(admission, nativeTurn, "prompt", () =>
+        this.client.session.promptAsync(
+          {
+            sessionID: this.sessionId,
+            directory: this.config.cwd,
             parts,
+            ...(dispatchMessageId ? { messageID: dispatchMessageId } : {}),
             ...(options?.outputSchema
               ? {
                   format: {
@@ -3919,47 +4091,18 @@ class OpenCodeAgentSession implements AgentSession {
             ...(model ? { model } : {}),
             ...(effectiveMode ? { agent: effectiveMode } : {}),
             ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-          });
-          this.traceOpenCode("provider.opencode.prompt_async.response", {
-            turnId,
-            hasError: promptResponse.error !== undefined,
-            error: promptResponse.error,
-            data: promptResponse.data,
-          });
-          if (promptResponse.error) {
-            this.finishForegroundTurn(
-              {
-                type: "turn_failed",
-                provider: "opencode",
-                error: toDiagnosticErrorMessage(promptResponse.error),
-              },
-              turnId,
-            );
-          }
-        } catch (error) {
-          this.traceOpenCode("provider.opencode.prompt_async.throw", {
-            turnId,
-            error:
-              error instanceof Error
-                ? { name: error.name, message: error.message, stack: error.stack }
-                : String(error),
-          });
-          this.finishForegroundTurn(
-            {
-              type: "turn_failed",
-              provider: "opencode",
-              error: toDiagnosticErrorMessage(error),
-            },
-            turnId,
-          );
-        }
-      })();
+          },
+          { signal: admission.signal },
+        ),
+      );
     }
-
+    if (nativeTurn) {
+      await this.awaitNativeSubmission(admission, nativeTurn, submission);
+    }
     return { turnId };
   }
 
-  private async awaitEventStreamReady(turnAbortController: AbortController): Promise<void> {
+  private async awaitSharedEventStreamReady(): Promise<void> {
     try {
       await withTimeout(
         this.events.ready(),
@@ -3967,7 +4110,6 @@ class OpenCodeAgentSession implements AgentSession {
         "OpenCode server.connected event",
       );
     } catch (error) {
-      if (this.abortController === turnAbortController) this.abortController = null;
       if (!(error instanceof Error) || error.message !== "OpenCode server.connected event") {
         throw error;
       }
@@ -3980,44 +4122,581 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
-  private rethrowRunnerWaitError(error: unknown): never {
-    if (this.closed) throw new Error("OpenCode session is closed", { cause: error });
-    throw error;
+  private async awaitNativeSubmission(
+    admission: OpenCodeAdmission,
+    turn: OpenCodeNativeTurn,
+    submission: Promise<void>,
+  ): Promise<void> {
+    // Settlement ends only the client request, not native execution. An exact native user
+    // echo also proves admission when a command keeps its HTTP response open while running.
+    await Promise.race([submission, turn.accepted.promise]);
+    admission.assertCurrent();
+    if (turn.submissionError && turn.submission)
+      throw new OpenCodeSubmissionOutcomeError(turn.submissionError.cause, turn.submission);
   }
+
+  private async assertExternalRunnerIdle(admission: OpenCodeAdmission): Promise<void> {
+    if (!this.externalServer || !admission.fence) return;
+    const revision = this.runnerStatusRevision;
+    const status = await admission.wait(this.readProviderRunnerStatus(admission.signal));
+    await admission.wait(this.drainOpenCodeIngress());
+    if (status === "idle" && revision === this.runnerStatusRevision) return;
+    throw new Error("External OpenCode runner changed or is busy during turn admission");
+  }
+
+  private rememberNativeClientMessage(turn: OpenCodeNativeTurn | null): void {
+    if (turn?.messageId && this.pendingClientMessageId)
+      this.nativeClientMessageIds.set(turn.messageId, this.pendingClientMessageId);
+  }
+
+  private async drainOpenCodeIngress(): Promise<void> {
+    let tail: Promise<void>;
+    do {
+      tail = this.ingress;
+      await tail;
+    } while (tail !== this.ingress);
+  }
+
+  private discardUnsubmittedAdmission(admission: OpenCodeAdmission): void {
+    if (admission.submitted || !admission.turnId) return;
+    if (
+      this.turnState.status === "stopping" &&
+      this.turnState.stop.ownerTurnId === admission.turnId
+    ) {
+      this.finishStoppingTurn(this.turnState.stop);
+    } else if (this.activeForegroundTurnId === admission.turnId) {
+      this.finishForegroundTurn(
+        { type: "turn_canceled", provider: "opencode", reason: "admission cancelled" },
+        admission.turnId,
+      );
+    }
+  }
+
+  private async submitNativeTurn(
+    admission: OpenCodeAdmission,
+    nativeTurn: OpenCodeNativeTurn | null,
+    kind: "prompt" | "command" | "compact",
+    submit: () => Promise<{ error?: unknown; response?: Response }>,
+  ): Promise<void> {
+    // This check is adjacent to the SDK invocation, including after turn_started subscribers.
+    admission.assertCurrent();
+    if (nativeTurn)
+      nativeTurn.submission = this.createNativeSubmission(admission, nativeTurn, kind);
+    admission.fence?.markRequestSent();
+    admission.assertCurrent();
+    if (admission.modeId !== undefined) {
+      this.currentMode = resolveOpenCodeRuntimeAgentId(admission.modeId) ?? null;
+      this.config.modeId = this.currentMode ?? undefined;
+      this.selectionRevision += 1;
+      this.localSelectionChanged = true;
+    }
+    admission.submitted = true;
+    this.nativeRequestControllers.add(admission.controller);
+    try {
+      const response = await submit();
+      if (response.error || response.response?.ok === false)
+        throw response.error ?? new Error(`OpenCode submission HTTP ${response.response?.status}`);
+      if (nativeTurn) {
+        nativeTurn.requestAcknowledged = true;
+        if (nativeTurn.submission && nativeTurn.submission.delivery !== "observed")
+          nativeTurn.submission.delivery = "acknowledged";
+      }
+    } catch (error) {
+      this.handleNativeSubmissionError(error, admission, nativeTurn, kind);
+    } finally {
+      this.nativeRequestControllers.delete(admission.controller);
+      this.publishNativeRuntime();
+    }
+  }
+
+  private handleNativeSubmissionError(
+    error: unknown,
+    admission: OpenCodeAdmission,
+    nativeTurn: OpenCodeNativeTurn | null,
+    kind: "prompt" | "command" | "compact",
+  ): void {
+    if (nativeTurn?.submission) {
+      nativeTurn.submissionError = { cause: error };
+      if (nativeTurn.submission.delivery !== "observed")
+        nativeTurn.submission.delivery = "uncertain";
+      nativeTurn.submission.error = toDiagnosticErrorMessage(error);
+      // A lost acknowledgement or AbortError says nothing about whether OpenCode admitted
+      // the POST. Retain identity and liveness; only native evidence can settle this turn.
+      this.requestsDirty = true;
+      nativeTurn.terminalObserved = true;
+      this.scheduleObservation();
+      return;
+    }
+    if (this.closed || admission.signal.aborted || this.activeForegroundTurnId !== admission.turnId)
+      return;
+    if (kind === "command" && isOpenCodeHeadersTimeoutFailure(error)) {
+      this.logger.warn(
+        { err: error, turnId: admission.turnId },
+        "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
+      );
+      return;
+    }
+    if (kind === "compact") this.suppressAssistantMessagesUntilIdle.active = false;
+    if (admission.turnId)
+      this.finishForegroundTurn(
+        { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(error) },
+        admission.turnId,
+      );
+  }
+
+  private createNativeSubmission(
+    admission: OpenCodeAdmission,
+    turn: OpenCodeNativeTurn,
+    operation: OpenCodeSubmissionReceipt["operation"],
+  ): OpenCodeSubmissionReceipt {
+    if (!this.serverUrl || !admission.fence)
+      throw new Error("OpenCode submission tracking requires endpoint and admission identity");
+    if (this.nativeSubmissions.size >= OPENCODE_SUBMISSION_RECEIPT_LIMIT) {
+      const settled = [...this.nativeSubmissions.values()].find(
+        (receipt) => receipt.terminal !== undefined,
+      );
+      if (!settled)
+        throw new Error("Too many unresolved OpenCode submissions; reconcile before sending");
+      this.nativeSubmissions.delete(settled.id);
+    }
+    const receipt: OpenCodeSubmissionReceipt = {
+      version: 1,
+      id: turn.messageId ?? `compact-${createOpenCodeDispatchMessageId()}`,
+      admissionId: admission.fence.id,
+      endpoint: externalOpenCodeSessionKey(this.serverUrl, "").slice(0, -1),
+      sessionId: this.sessionId,
+      turnId: turn.turnId,
+      messageId: turn.messageId,
+      operation,
+      delivery: "in_flight",
+      callerInterrupted: false,
+    };
+    this.nativeSubmissions.set(receipt.id, receipt);
+    admission.submissionId = receipt.id;
+    return receipt;
+  }
+
+  private unresolvedNativeSubmission(): OpenCodeSubmissionReceipt | undefined {
+    return [...this.nativeSubmissions.values()].find((receipt) => receipt.terminal === undefined);
+  }
+
+  private async resolvePriorNativeSubmissions(): Promise<void> {
+    if (!this.unresolvedNativeSubmission()) return;
+    await this.reconcileNativeSubmissions();
+    const unresolved = this.unresolvedNativeSubmission();
+    if (unresolved)
+      throw new OpenCodeSubmissionOutcomeError(
+        "An earlier native submission is unresolved",
+        unresolved,
+      );
+  }
+
+  getNativeSubmissions(): OpenCodeSubmissionReceipt[] {
+    return structuredClone([...this.nativeSubmissions.values()]);
+  }
+
+  async reconcileNativeSubmissions(): Promise<OpenCodeSubmissionReceipt[]> {
+    if (this.closed) throw new Error("OpenCode session is closed");
+    const signal = AbortSignal.any([this.observationAbort.signal, AbortSignal.timeout(10_000)]);
+    const revision = this.runnerStatusRevision;
+    // Keep raw, including reverted messages: undoing a transcript is not undoing admission.
+    const response = await waitForOpenCodeObservation(
+      this.client.session.messages(
+        { sessionID: this.sessionId, directory: this.config.cwd },
+        { signal },
+      ),
+      signal,
+    );
+    if (response.error || !response.data)
+      throw new Error(
+        `Failed to read OpenCode submission history: ${toDiagnosticErrorMessage(response.error ?? "missing data")}`,
+      );
+    const status = await waitForOpenCodeObservation(this.readProviderRunnerStatus(signal), signal);
+    signal.throwIfAborted();
+    for (const receipt of this.nativeSubmissions.values()) {
+      this.reconcileNativeSubmission(
+        receipt,
+        response.data,
+        status === "idle" && revision === this.runnerStatusRevision,
+      );
+    }
+    this.publishNativeRuntime();
+    return this.getNativeSubmissions();
+  }
+
+  private reconcileNativeSubmission(
+    receipt: OpenCodeSubmissionReceipt,
+    messages: OpenCodeSessionMessage[],
+    idleConfirmed: boolean,
+  ): void {
+    if (receipt.terminal || !receipt.messageId) return;
+    const present = messages.some(
+      (message) =>
+        message.info.id === receipt.messageId &&
+        message.info.sessionID === this.sessionId &&
+        message.info.role === "user",
+    );
+    if (!present) return; // Absence/idle never proves a delayed POST cannot still arrive.
+    receipt.delivery = "observed";
+    if (this.fencedNativeTurn?.submission?.id === receipt.id)
+      this.fencedNativeTurn.accepted.resolve();
+    const last = messages.findLast(
+      (message) =>
+        message.info.role === "assistant" &&
+        message.info.sessionID === this.sessionId &&
+        message.info.parentID === receipt.messageId,
+    );
+    if (!idleConfirmed || last?.info.role !== "assistant" || last.info.time.completed === undefined)
+      return;
+    const terminal: TerminalTurnEvent = last.info.error
+      ? toOpenCodeSessionErrorTerminal(last.info.error)
+      : { type: "turn_completed", provider: "opencode" };
+    receipt.terminal = terminal.type;
+    if (terminal.type === "turn_failed") receipt.error = terminal.error;
+    if (
+      this.fencedNativeTurn?.submission?.id === receipt.id &&
+      this.activeForegroundTurnId === receipt.turnId
+    )
+      this.finishForegroundTurn(terminal, receipt.turnId);
+  }
+
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    if (this.closed) return () => {};
+    if (this.subscribers.has(callback))
+      return () => {
+        this.subscribers.delete(callback);
+      };
     this.subscribers.add(callback);
-    this.startExternalStatusReconciliation();
+    // SSE starts during construction and can observe a native turn before manager attachment.
+    // Replay its existing identity before requests; do not create a replacement autonomous turn.
+    const turnId = this.activeForegroundTurnId;
+    if (turnId) callback({ type: "turn_started", provider: "opencode", turnId });
+    if (this.closed) return () => {};
+    for (const request of this.pendingPermissions.values()) {
+      callback({ type: "permission_requested", provider: "opencode", request });
+    }
+    // A plain managed session's shared event bus has been live since construction, so there is
+    // nothing this subscriber could have missed — running this check would just repeat work
+    // upstream's shared-bus + gap-repair reconciliation already does for it. `externallyDriven`
+    // also covers an adopted child session (registered mid-flight from a subagent discovery),
+    // which genuinely may have activity from before this subscriber attached.
+    if (this.externallyDriven) {
+      this.requestsDirty = true;
+      this.scheduleObservation(0);
+    }
     this.startChildSessionHydration();
     return () => {
       this.subscribers.delete(callback);
     };
   }
 
-  private startExternalStatusReconciliation(): void {
-    if (!this.externallyDriven || this.externalStatusReconciliationStarted || this.closed) {
+  subscribeNativeHistory(replace: OpenCodeHistorySink): () => void {
+    if (this.replaceNativeHistory) throw new Error("OpenCode native history already has an owner");
+    this.replaceNativeHistory = replace;
+    const abort = new AbortController();
+    this.nativeHistoryAbort = abort;
+    this.nativeHistoryFingerprint = null;
+    this.historyDirty = true;
+    this.scheduleObservation(0);
+    return () => {
+      if (this.replaceNativeHistory === replace) {
+        this.replaceNativeHistory = null;
+        abort.abort(new Error("OpenCode native history consumer detached"));
+      }
+    };
+  }
+
+  subscribeNativeRequests(
+    replace: (requests: readonly AgentPermissionRequest[]) => void,
+  ): () => void {
+    this.nativeRequestSubscribers.add(replace);
+    replace(this.getPendingPermissions());
+    return () => {
+      this.nativeRequestSubscribers.delete(replace);
+    };
+  }
+
+  private publishNativeRequests(): void {
+    if (this.closed) return;
+    for (const replace of this.nativeRequestSubscribers) replace(this.getPendingPermissions());
+  }
+
+  private scheduleObservation(delayMs = 100): void {
+    if (this.closed || this.cancelObservation || this.observationTask) return;
+    if (
+      !this.replaceNativeHistory &&
+      this.subscribers.size === 0 &&
+      this.turnState.status === "idle"
+    )
       return;
-    }
-    this.externalStatusReconciliationStarted = true;
-    void this.reconcileExternalRunnerStatus().catch((error) => {
-      this.logger.warn(
-        { err: error, sessionId: this.sessionId },
-        "Failed to reconcile externally driven OpenCode session status",
-      );
+    this.cancelObservation = this.observationTiming.arm(delayMs, () => {
+      this.cancelObservation = null;
+      this.observationTask = this.reconcileObservation()
+        .then(() => {
+          this.observationRetryMs = 100;
+          return undefined;
+        })
+        .catch((error) => {
+          this.logger.warn(
+            { err: error, sessionId: this.sessionId },
+            "OpenCode observation recovery failed; retrying",
+          );
+          this.observationRetryMs = Math.min(this.observationRetryMs * 2, 5_000);
+        })
+        .finally(() => {
+          this.observationTask = null;
+          if (this.requestsDirty || (this.historyDirty && this.replaceNativeHistory)) {
+            this.scheduleObservation(this.observationRetryMs);
+          }
+        });
     });
   }
 
-  private async reconcileExternalRunnerStatus(): Promise<void> {
-    await this.events.ready();
-    const observedRevision = this.runnerStatusRevision;
-    const runnerStatus = await this.readProviderRunnerStatus();
-    if (
-      this.runnerStatusRevision !== observedRevision ||
-      this.turnState.status !== "idle" ||
-      !isOpenCodeRunnerActive(runnerStatus)
+  private async reconcileObservation(): Promise<void> {
+    // A managed session's live events already arrive through the shared event bus subscribed in
+    // the constructor; `ensureEventStreamReady` starts `consumeEventStream`, the isolated
+    // per-adapter stream external sessions use instead of that bus. Starting it here too would
+    // double-consume every event alongside the shared subscription. The REST-based reconciliation
+    // below (permission/question/status polling) doesn't depend on that stream either way.
+    if (this.externalServer) await this.ensureEventStreamReady();
+    if (this.closed) return;
+    const request = new AbortController();
+    const cancelTimeout = this.observationTiming.arm(10_000, () =>
+      request.abort(new Error("OpenCode observation timed out")),
+    );
+    const signal = AbortSignal.any([request.signal, this.observationAbort.signal]);
+    try {
+      // Independent failures retain their own dirty flag. Do not release the observation gate
+      // before every read settles, or a slow stale snapshot could overwrite the next recovery.
+      const results = await Promise.allSettled([
+        this.requestsDirty ? this.reconcileBlockingRequestsAndStatus(signal) : Promise.resolve(),
+        this.historyDirty && this.replaceNativeHistory
+          ? this.reconcileNativeHistory(signal)
+          : Promise.resolve(),
+      ]);
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    } finally {
+      cancelTimeout();
+    }
+  }
+
+  private async reconcileNativeHistory(signal: AbortSignal): Promise<void> {
+    if (!this.nativeHistoryAbort) return;
+    signal = AbortSignal.any([signal, this.nativeHistoryAbort.signal]);
+    const revision = this.historyRevision;
+    const selectionRevision = this.selectionRevision;
+    const replace = this.replaceNativeHistory;
+    const { session, messages } = await this.readNativeHistory(signal);
+    if (this.closed || replace !== this.replaceNativeHistory || !replace) return;
+    // There is only one snapshot writer and no concurrent root timeline appender. Publish this
+    // read, then catch up again if SSE advanced while it was in flight. Discarding every overlapping
+    // read would starve the display for the entire duration of a fast-streaming turn.
+    const snapshot = messages.flatMap(buildOpenCodeReplayTimelineEvents).map((event) => {
+      const item = event.item;
+      const clientMessageId =
+        item.type === "user_message" && item.messageId
+          ? this.nativeClientMessageIds.get(item.messageId)
+          : undefined;
+      return clientMessageId
+        ? Object.assign({}, event, { item: Object.assign({}, item, { clientMessageId }) })
+        : event;
+    });
+    const fingerprint = JSON.stringify(snapshot);
+    if (fingerprint !== this.nativeHistoryFingerprint)
+      await waitForOpenCodeObservation(replace(snapshot, signal), signal);
+    if (this.closed || replace !== this.replaceNativeHistory) return;
+    this.nativeHistoryFingerprint = fingerprint;
+    this.historyDirty = revision !== this.historyRevision;
+    this.refreshNativeSelection(session, messages, selectionRevision === this.selectionRevision);
+  }
+
+  private refreshNativeSelection(
+    session: OpenCodePersistedSession,
+    messages: OpenCodeSessionMessage[],
+    apply: boolean,
+  ): void {
+    const selection = readLatestOpenCodeSelection(messages);
+    const model = resolveOpenCodePersistedSessionModel(session, messages);
+    const modeId = resolveOpenCodePersistedSessionModeId(session, messages);
+    const fingerprint = JSON.stringify([selection?.info.id, model, modeId]);
+    if (fingerprint === this.selectionFingerprint) return;
+    const firstSnapshot = this.selectionFingerprint === null;
+    this.selectionFingerprint = fingerprint;
+    if (!apply || (firstSnapshot && this.localSelectionChanged)) return;
+    this.localSelectionChanged = false;
+    if (model) {
+      this.config.model = model;
+      this.selectedModelContextWindowMaxTokens =
+        this.resolveConfiguredModelContextWindowMaxTokens(model);
+    }
+    if (modeId) {
+      this.currentMode = modeId;
+      this.config.modeId = modeId;
+    }
+    this.notifySubscribers(
+      {
+        type: "model_changed",
+        provider: "opencode",
+        runtimeInfo: this.runtimeInfoSnapshot(),
+      },
+      null,
+    );
+  }
+
+  private async reconcileBlockingRequestsAndStatus(signal: AbortSignal): Promise<void> {
+    const requestRevision = this.requestRevision;
+    const statusRevision = this.runnerStatusRevision;
+    const turnState = this.turnState;
+    const directories = new Set([
+      this.config.cwd,
+      ...this.childSessionCwds.values(),
+      ...this.pendingPermissionDirectories.values(),
+    ]);
+    for (const directory of directories) {
+      await this.reconcileDirectoryRequests(directory, signal, requestRevision);
+    }
+    const status = await waitForOpenCodeObservation(this.readProviderRunnerStatus(signal), signal);
+    if (this.closed || requestRevision !== this.requestRevision) return;
+    if (statusRevision !== this.runnerStatusRevision || turnState !== this.turnState) return;
+    await this.applyObservedRunnerStatus(status, statusRevision, signal);
+    this.requestsDirty = requestRevision !== this.requestRevision;
+    this.requestsDirty ||= this.fencedNativeTurn?.terminalObserved === true;
+    if (!this.requestsDirty) this.runnerRecoveryRequired = false;
+  }
+
+  private async applyObservedRunnerStatus(
+    status: OpenCodeRunnerStatus,
+    statusRevision: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.runnerRecoveryRequired && this.turnState.status === "stopping" && status === "idle")
+      this.finishStoppingTurn(this.turnState.stop);
+    else if (
+      (this.runnerRecoveryRequired || this.fencedNativeTurn?.terminalObserved) &&
+      this.turnState.status === "running" &&
+      status === "idle"
     ) {
+      await this.settleRecoveredTurn(this.turnState.turnId, statusRevision, signal);
+    } else if (
+      this.externallyDriven &&
+      this.turnState.status === "idle" &&
+      isOpenCodeRunnerActive(status)
+    ) {
+      this.startAutonomousTurn();
+    }
+  }
+
+  private async settleRecoveredTurn(
+    turnId: string,
+    statusRevision: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.fencedNativeTurn?.turnId === turnId) {
+      await this.verifyFencedNativeTerminal(this.fencedNativeTurn);
       return;
     }
-    this.startAutonomousTurn();
+    const { messages } = await this.readNativeHistory(signal);
+    if (
+      this.closed ||
+      this.runnerStatusRevision !== statusRevision ||
+      this.activeForegroundTurnId !== turnId
+    )
+      return;
+    const latestUser = messages.findLastIndex((message) => message.info.role === "user");
+    const latest = messages
+      .slice(latestUser + 1)
+      .findLast((message) => message.info.role === "assistant");
+    const error = latest?.info.role === "assistant" ? latest.info.error : undefined;
+    if (error) {
+      const events: AgentStreamEvent[] = [];
+      appendOpenCodeSessionError(
+        {
+          id: "recovered",
+          type: "session.error",
+          properties: { sessionID: this.sessionId, error },
+        },
+        this.createTranslationState(),
+        events,
+      );
+      const terminal = events.map(toTerminalTurnEvent).find((event) => event !== null);
+      if (terminal) this.finishForegroundTurn(terminal, turnId);
+    } else {
+      this.finishForegroundTurn({ type: "turn_completed", provider: "opencode" }, turnId);
+    }
+  }
+
+  private async reconcileDirectoryRequests(
+    directory: string,
+    signal: AbortSignal,
+    requestRevision: number,
+  ): Promise<void> {
+    const [permissions, questions] = await waitForOpenCodeObservation(
+      Promise.all([
+        this.client.permission.list({ directory }, { signal }),
+        this.client.question.list({ directory }, { signal }),
+      ]),
+      signal,
+    );
+    if (permissions.error || !permissions.data || questions.error || !questions.data) {
+      throw new Error("Failed to read pending OpenCode requests");
+    }
+    if (this.closed || requestRevision !== this.requestRevision) return;
+    const owned = (id: string) => id === this.sessionId || this.knownChildSessionIds.has(id);
+    const liveIds = new Set<string>();
+    for (const properties of permissions.data) {
+      if (!owned(properties.sessionID)) continue;
+      liveIds.add(properties.id);
+      this.hydratePendingRequest(
+        { id: properties.id, type: "permission.asked", properties },
+        directory,
+      );
+    }
+    for (const properties of questions.data) {
+      if (!owned(properties.sessionID)) continue;
+      liveIds.add(properties.id);
+      this.hydratePendingRequest(
+        { id: properties.id, type: "question.asked", properties },
+        directory,
+      );
+    }
+    if (this.closed || requestRevision !== this.requestRevision) return;
+    for (const [id, pendingDirectory] of this.pendingPermissionDirectories) {
+      if (pendingDirectory === directory && !liveIds.has(id)) {
+        // Absence establishes resolution, not the decision taken by another client.
+        this.resolvePendingRequest(id);
+      }
+    }
+  }
+
+  private resolvePendingRequest(id: string, resolution?: AgentPermissionResponse): void {
+    if (!this.pendingPermissions.delete(id)) return;
+    this.pendingPermissionDirectories.delete(id);
+    this.publishNativeRequests();
+    if (resolution)
+      this.notifySubscribers(
+        { type: "permission_resolved", provider: "opencode", requestId: id, resolution },
+        null,
+      );
+  }
+
+  private hydratePendingRequest(event: OpenCodeEvent, directory: string): void {
+    const sessionId = getOpenCodeEventSessionId(event);
+    const state =
+      sessionId && sessionId !== this.sessionId
+        ? this.getChildTranslationState(sessionId)
+        : this.createTranslationState();
+    for (const translated of translateOpenCodeEvent(event, state)) {
+      if (
+        translated.type !== "permission_requested" ||
+        this.pendingPermissions.has(translated.request.id)
+      )
+        continue;
+      this.pendingPermissions.set(translated.request.id, translated.request);
+      this.pendingPermissionDirectories.set(translated.request.id, directory);
+      this.notifySubscribers(translated, null);
+    }
+    this.publishNativeRequests();
   }
 
   private startChildSessionHydration(): void {
@@ -4256,6 +4935,19 @@ class OpenCodeAgentSession implements AgentSession {
       return;
     }
     if (event.event.type === "upsert") {
+      if (!this.observedChildSessionIds.has(event.event.id)) {
+        this.observedChildSessionIds.add(event.event.id);
+        this.requestRevision += 1;
+        // A child discovered live through this (managed) session's own event stream is already
+        // tracked by that stream; polling for it would only race an unconfigured/stale list read
+        // against the live event that just arrived. An externally-driven session (a truly
+        // external server, or a resumed/adopted child) has no such live stream of its own to
+        // trust yet, so it still needs this poll to catch up on pre-existing state.
+        if (this.externallyDriven) {
+          this.requestsDirty = true;
+          this.scheduleObservation();
+        }
+      }
       this.unrelatedSessionIds.delete(event.event.id);
       if (event.event.cwd) {
         this.childSessionCwds.set(event.event.id, event.event.cwd);
@@ -4264,6 +4956,12 @@ class OpenCodeAgentSession implements AgentSession {
         registerOpenCodeChildSessionServerUrl(event.event.id, this.serverUrl);
       }
     } else if (event.event.type === "remove") {
+      this.observedChildSessionIds.delete(event.event.id);
+      this.requestRevision += 1;
+      if (this.externallyDriven) {
+        this.requestsDirty = true;
+        this.scheduleObservation();
+      }
       unregisterOpenCodeChildSessionServerUrl(event.event.id);
       this.childTranslationStates.delete(event.event.id);
       this.childSessionCwds.delete(event.event.id);
@@ -4456,6 +5154,124 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
+  private ensureEventStreamReady(): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error("OpenCode session is closed"));
+    }
+    if (this.eventStreamReady) {
+      return this.eventStreamReady.promise;
+    }
+
+    const eventStreamAbortController = new AbortController();
+    const eventStreamReady = createDeferred<void>();
+    this.eventStreamAbortController = eventStreamAbortController;
+    this.eventStreamReady = eventStreamReady;
+    const eventStreamTask = this.consumeEventStream(
+      eventStreamAbortController,
+      eventStreamReady,
+    ).finally(() => {
+      if (this.eventStreamAbortController === eventStreamAbortController) {
+        this.eventStreamAbortController = null;
+        this.eventStreamReady = null;
+      }
+      if (this.eventStreamTask === eventStreamTask) {
+        this.eventStreamTask = null;
+      }
+    });
+    this.eventStreamTask = eventStreamTask;
+    void eventStreamTask.catch((error) => {
+      this.logger.warn(
+        { err: error, sessionId: this.sessionId },
+        "OpenCode event stream task failed",
+      );
+    });
+
+    return eventStreamReady.promise;
+  }
+
+  private async consumeEventStream(
+    eventStreamAbortController: AbortController,
+    eventStreamReady: Deferred<void>,
+  ): Promise<void> {
+    try {
+      await consumeOpenCodeEvents({
+        client: this.client,
+        signal: eventStreamAbortController.signal,
+        logger: this.logger,
+        timing: this.observationTiming,
+        onConnected: () => {
+          this.connectionCount += 1;
+          this.runnerRecoveryRequired ||= this.connectionCount > 1;
+          eventStreamReady.resolve();
+          this.requestRevision += 1;
+          this.historyRevision += 1;
+          this.requestsDirty = true;
+          this.historyDirty = true;
+          this.scheduleObservation(0);
+        },
+        onEvent: (rawEvent) => {
+          const event = unwrapOpenCodeGlobalEvent(rawEvent);
+          if (!event || this.closed) return;
+          const dispatchGeneration = this.dispatchGeneration;
+          if (
+            event.type === "message.updated" &&
+            event.properties.info.sessionID === this.sessionId
+          ) {
+            const info = event.properties.info;
+            if (info.role === "assistant" && info.parentID)
+              this.assistantParents.set(info.id, info.parentID);
+            if (
+              info.role === "user" &&
+              info.id === this.fencedNativeTurn?.messageId &&
+              this.fencedNativeTurn.submission
+            ) {
+              this.fencedNativeTurn.submission.delivery = "observed";
+              this.fencedNativeTurn.accepted.resolve();
+              this.publishNativeRuntime();
+            }
+          }
+          // Stamp at ingress, before any asynchronous translation or snapshot operation.
+          this.observeRunnerStatusEvent(event);
+          const eventSessionId = getOpenCodeEventSessionId(event);
+          const owned =
+            eventSessionId === this.sessionId ||
+            (eventSessionId !== null && this.knownChildSessionIds.has(eventSessionId));
+          if (
+            owned &&
+            (event.type.startsWith("permission.") || event.type.startsWith("question."))
+          ) {
+            this.requestRevision += 1;
+          }
+          if (
+            getOpenCodeEventSessionId(event) === this.sessionId &&
+            (event.type.startsWith("message.") ||
+              event.type === "session.updated" ||
+              event.type === "session.compacted")
+          ) {
+            this.historyRevision += 1;
+            this.historyDirty = true;
+            this.scheduleObservation();
+          }
+          this.ingress = this.ingress
+            .then(() =>
+              this.consumeOpenCodeStreamEvent({ rawEvent, eventCount: 0, dispatchGeneration }),
+            )
+            .catch((error) => {
+              this.logger.warn(
+                { err: error, sessionId: this.sessionId },
+                "OpenCode event translation failed",
+              );
+              this.requestsDirty = true;
+              this.historyDirty = true;
+              this.scheduleObservation();
+            });
+        },
+      });
+    } finally {
+      eventStreamReady.reject(new Error("OpenCode observation closed"));
+    }
+  }
+
   private isOwnedSessionId(sessionId: string): boolean {
     return sessionId === this.sessionId || this.knownChildSessionIds.has(sessionId);
   }
@@ -4463,6 +5279,7 @@ class OpenCodeAgentSession implements AgentSession {
   private async consumeOpenCodeStreamEvent(params: {
     rawEvent: unknown;
     eventCount: number;
+    dispatchGeneration?: number;
   }): Promise<void> {
     const { rawEvent, eventCount } = params;
     let turnId = this.activeForegroundTurnId;
@@ -4476,22 +5293,19 @@ class OpenCodeAgentSession implements AgentSession {
       rawEvent,
       properties: event?.properties,
     });
-    if (!event) {
+    if (!event || this.closed) {
       return;
     }
-    this.observeRunnerStatusEvent(event);
+    if (this.consumeRequestResolution(event)) return;
+    const intercepted = this.interceptFencedEvent(event, params.dispatchGeneration);
+    if (intercepted !== undefined) {
+      if (intercepted !== "discard") await intercepted;
+      return;
+    }
     if (this.discardEventWhileStopping(event, eventCount)) {
       return;
     }
-    const translated = await this.translateEvent(event);
-    const foregroundEvents: AgentStreamEvent[] = [];
-    for (const translatedEvent of translated) {
-      if (isOpenCodeProviderInternalEvent(translatedEvent)) {
-        this.notifySubscribers(translatedEvent, null);
-      } else {
-        foregroundEvents.push(translatedEvent);
-      }
-    }
+    const foregroundEvents = this.publishInternalEvents(await this.translateEvent(event));
     if (!turnId && this.shouldStartAutonomousTurn(event)) {
       turnId = this.startAutonomousTurn();
     }
@@ -4531,6 +5345,163 @@ class OpenCodeAgentSession implements AgentSession {
       }
       this.notifySubscribers(e, turnId);
     }
+  }
+
+  private interceptFencedEvent(
+    event: OpenCodeEvent,
+    generation: number | undefined,
+  ): "discard" | Promise<void> | undefined {
+    if (getOpenCodeEventSessionId(event) !== this.sessionId) return undefined;
+    if (generation !== undefined && generation !== this.dispatchGeneration) return "discard";
+    if (
+      this.fencedNativeTurn &&
+      this.turnState.status === "running" &&
+      isOpenCodeTerminalEvent(event, this.sessionId)
+    ) {
+      this.fencedNativeTurn.terminalObserved = true;
+      this.requestsDirty = true;
+      return this.verifyFencedNativeTerminal(this.fencedNativeTurn).then(() =>
+        this.scheduleObservation(),
+      );
+    }
+    return this.isOtherDispatchMessage(event) ? "discard" : undefined;
+  }
+
+  private isOtherDispatchMessage(event: OpenCodeEvent): boolean {
+    const messageId = this.fencedNativeTurn?.messageId;
+    if (!messageId) return false;
+    if (event.type === "message.updated") {
+      const info = event.properties.info;
+      return info.role === "user" ? info.id !== messageId : info.parentID !== messageId;
+    }
+    let partMessageId: string | null = null;
+    if (event.type === "message.part.updated") partMessageId = event.properties.part.messageID;
+    if (event.type === "message.part.delta") partMessageId = event.properties.messageID;
+    return (
+      partMessageId !== null &&
+      partMessageId !== messageId &&
+      this.assistantParents.get(partMessageId) !== messageId
+    );
+  }
+
+  private async verifyFencedNativeTerminal(turn: OpenCodeNativeTurn): Promise<void> {
+    const revision = this.runnerStatusRevision;
+    const signal = this.observationAbort.signal;
+    const status = await this.readProviderRunnerStatus(signal);
+    if (!this.isCurrentNativeTurn(turn, revision)) return;
+    if (status !== "idle") {
+      turn.terminalObserved = false;
+      return;
+    }
+    if (!turn.messageId) {
+      // summarize has no caller-supplied message ID. Its own completed HTTP operation plus
+      // current native idle is the boundary; an older idle cannot acknowledge an in-flight call.
+      if (turn.requestAcknowledged)
+        this.finishForegroundTurn({ type: "turn_completed", provider: "opencode" }, turn.turnId);
+      return;
+    }
+    const { messages } = await this.readNativeHistory(signal);
+    if (!this.isCurrentNativeTurn(turn, revision)) return;
+    if (!messages.some((message) => message.info.id === turn.messageId)) return;
+    if (turn.submission) turn.submission.delivery = "observed";
+    turn.accepted.resolve();
+    const last = messages.findLast(
+      (message) => message.info.role === "assistant" && message.info.parentID === turn.messageId,
+    );
+    if (!last || last.info.role !== "assistant" || last.info.time.completed === undefined) return;
+    const events: AgentStreamEvent[] = [];
+    if (last.info.error) {
+      appendOpenCodeSessionError(
+        {
+          id: "recovered",
+          type: "session.error",
+          properties: { sessionID: this.sessionId, error: last.info.error },
+        },
+        this.createTranslationState(),
+        events,
+      );
+    } else {
+      events.push({
+        type: "turn_completed",
+        provider: "opencode",
+        usage: { ...this.accumulatedUsage },
+      });
+    }
+    const terminal = events.map(toTerminalTurnEvent).find((event) => event !== null);
+    if (terminal) this.finishForegroundTurn(terminal, turn.turnId);
+  }
+
+  private isCurrentNativeTurn(turn: OpenCodeNativeTurn, revision: number): boolean {
+    return (
+      !this.closed &&
+      this.fencedNativeTurn === turn &&
+      this.activeForegroundTurnId === turn.turnId &&
+      this.runnerStatusRevision === revision
+    );
+  }
+
+  private publishInternalEvents(translated: AgentStreamEvent[]): AgentStreamEvent[] {
+    const foregroundEvents: AgentStreamEvent[] = [];
+    for (const translatedEvent of translated) {
+      if (translatedEvent.type === "timeline" && translatedEvent.item.type === "user_message") {
+        const { messageId, clientMessageId } = translatedEvent.item;
+        const matchesAdmission =
+          !this.fencedNativeTurn || messageId === this.fencedNativeTurn.messageId;
+        if (messageId && clientMessageId && matchesAdmission)
+          this.nativeClientMessageIds.set(messageId, clientMessageId);
+      }
+      if (translatedEvent.type === "timeline" && this.replaceNativeHistory) continue;
+      if (isOpenCodeProviderInternalEvent(translatedEvent)) {
+        this.notifySubscribers(translatedEvent, null);
+      } else {
+        foregroundEvents.push(translatedEvent);
+      }
+    }
+    return foregroundEvents;
+  }
+
+  private consumeRequestResolution(event: OpenCodeEvent): boolean {
+    if (
+      event.type !== "permission.replied" &&
+      event.type !== "question.replied" &&
+      event.type !== "question.rejected"
+    )
+      return false;
+    if (
+      event.properties.sessionID === this.sessionId ||
+      this.knownChildSessionIds.has(event.properties.sessionID)
+    ) {
+      this.resolvePendingRequest(event.properties.requestID, this.nativeRequestResolution(event));
+    }
+    return true;
+  }
+
+  private nativeRequestResolution(
+    event: Extract<
+      OpenCodeEvent,
+      { type: "permission.replied" | "question.replied" | "question.rejected" }
+    >,
+  ): AgentPermissionResponse {
+    if (event.type === "question.rejected") return { behavior: "deny" };
+    if (event.type === "permission.replied") {
+      if (event.properties.reply === "reject") return { behavior: "deny" };
+      return {
+        behavior: "allow",
+        selectedActionId:
+          event.properties.reply === "always"
+            ? OPENCODE_PERMISSION_ACTION_ALLOW_ALWAYS
+            : OPENCODE_PERMISSION_ACTION_ALLOW_ONCE,
+      };
+    }
+    const pending = this.pendingPermissions.get(event.properties.requestID);
+    const questions = pending?.input?.questions;
+    const answers: Record<string, string> = {};
+    if (Array.isArray(questions))
+      questions.forEach((question, index) => {
+        const header = readNonEmptyString(readOpenCodeRecord(question)?.header);
+        if (header) answers[header] = (event.properties.answers[index] ?? []).join(", ");
+      });
+    return { behavior: "allow", updatedInput: { answers } };
   }
 
   private discardEventWhileStopping(event: OpenCodeEvent, eventCount: number): boolean {
@@ -4582,6 +5553,7 @@ class OpenCodeAgentSession implements AgentSession {
     const turnId = this.createTurnId();
     this.materializedParts.clear();
     this.turnState = { status: "running", turnId };
+    this.fencedNativeTurn = null;
     this.runningToolCalls.clear();
     this.subAgentsByCallId.clear();
     this.subAgentCallIdByChildSessionId.clear();
@@ -4608,6 +5580,12 @@ class OpenCodeAgentSession implements AgentSession {
     if (this.activeForegroundTurnId !== turnId) {
       return;
     }
+    const receipt = this.fencedNativeTurn?.submission;
+    if (receipt) {
+      receipt.terminal = event.type;
+      if (event.type === "turn_failed") receipt.error = event.error;
+    }
+    resetOpenCodeTurnTrackingState(this.createTranslationState());
     if (event.type === "turn_canceled" || event.type === "turn_failed") {
       this.synthesizeInterruptedToolCalls(turnId);
     } else {
@@ -4617,6 +5595,7 @@ class OpenCodeAgentSession implements AgentSession {
     this.pendingClientMessageId = null;
     this.pendingSteerSubmissions = [];
     this.turnState = { status: "idle" };
+    this.fencedNativeTurn = null;
     this.abortController = null;
     this.notifySubscribers(event, turnId);
   }
@@ -4634,6 +5613,7 @@ class OpenCodeAgentSession implements AgentSession {
       return this.issueOwnedAbort(this.turnState.stop);
     }
     const stop: OpenCodeStop = {
+      ownerTurnId: turnId,
       pendingCancellationTurnId: turnId,
       terminal: createDeferred<void>(),
     };
@@ -4709,6 +5689,7 @@ class OpenCodeAgentSession implements AgentSession {
     const contextWindowMaxTokens = this.resolveSelectedModelContextWindowMaxTokens();
     this.accumulatedUsage = contextWindowMaxTokens !== undefined ? { contextWindowMaxTokens } : {};
     this.turnState = { status: "idle" };
+    this.fencedNativeTurn = null;
     stop.terminal.resolve();
   }
 
@@ -4793,28 +5774,49 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    const sessionResponse = await this.client.session.get({
-      sessionID: this.sessionId,
-      directory: this.config.cwd,
-    });
-    const response = await this.client.session.messages({
-      sessionID: this.sessionId,
-      directory: this.config.cwd,
-    });
-
-    if (response.error || !response.data) {
-      return;
-    }
-
-    const messages = filterOpenCodeRevertedMessages(
-      response.data,
-      sessionResponse.error ? null : sessionResponse.data?.revert,
-    );
+    const { messages } = await this.readNativeHistory(this.observationAbort.signal);
     for (const message of messages) {
       for (const event of buildOpenCodeReplayTimelineEvents(message)) {
         yield event;
       }
     }
+  }
+
+  async readTurnTimeline(turnId: string): Promise<AgentTimelineItem[]> {
+    const receipt = [...this.nativeSubmissions.values()].find((entry) => entry.turnId === turnId);
+    if (!receipt) throw new Error("Missing OpenCode submission identity for result read");
+    if (receipt.operation === "compact") return [];
+    const signal = AbortSignal.any([this.observationAbort.signal, AbortSignal.timeout(10_000)]);
+    const { messages } = await this.readNativeHistory(signal);
+    const owned = messages.filter(
+      (message) =>
+        message.info.id === receipt.messageId ||
+        (message.info.role === "assistant" && message.info.parentID === receipt.messageId),
+    );
+    return owned.flatMap(buildOpenCodeReplayTimelineEvents).map((event) => event.item);
+  }
+
+  private async readNativeHistory(
+    signal: AbortSignal,
+  ): Promise<{ session: OpenCodePersistedSession; messages: OpenCodeSessionMessage[] }> {
+    const response = await waitForOpenCodeObservation(
+      this.client.session.get(
+        { sessionID: this.sessionId, directory: this.config.cwd },
+        { signal },
+      ),
+      signal,
+    );
+    if (response.error || !response.data) {
+      throw new Error(
+        `Failed to read OpenCode session for history: ${toDiagnosticErrorMessage(response.error ?? "missing data")}`,
+      );
+    }
+    const session = response.data;
+    const messages = await waitForOpenCodeObservation(
+      readOpenCodeSessionMessagesFromSdk(this.client, session, signal),
+      signal,
+    );
+    return { session, messages };
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {
@@ -4844,6 +5846,8 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async setMode(modeId: string): Promise<void> {
+    this.selectionRevision += 1;
+    this.localSelectionChanged = true;
     const normalizedModeId = normalizeOpenCodeModeId(modeId);
     if (normalizedModeId === OPENCODE_LEGACY_FULL_ACCESS_MODE_ID) {
       this.currentMode = OPENCODE_BUILD_MODE_ID;
@@ -4881,10 +5885,11 @@ class OpenCodeAgentSession implements AgentSession {
     const directory = this.pendingPermissionDirectories.get(requestId) ?? this.config.cwd;
     if (pending.kind === "question") {
       if (response.behavior === "deny") {
-        await this.client.question.reject({
+        const result = await this.client.question.reject({
           requestID: requestId,
           directory,
         });
+        if (result.error) throw new Error(toDiagnosticErrorMessage(result.error));
       } else {
         const answersRecord = readOpenCodeRecord(response.updatedInput?.answers);
         const questions = Array.isArray(pending.input?.questions) ? pending.input.questions : [];
@@ -4900,28 +5905,30 @@ class OpenCodeAgentSession implements AgentSession {
             .filter((entry) => entry.length > 0);
         });
 
-        await this.client.question.reply({
+        const result = await this.client.question.reply({
           requestID: requestId,
           directory,
           answers,
         });
+        if (result.error) throw new Error(toDiagnosticErrorMessage(result.error));
       }
 
-      this.pendingPermissions.delete(requestId);
-      this.pendingPermissionDirectories.delete(requestId);
+      this.requestRevision += 1;
+      this.resolvePendingRequest(requestId, response);
       return;
     }
 
     const reply = resolveOpenCodePermissionReply(response);
-    await this.client.permission.reply({
+    const result = await this.client.permission.reply({
       requestID: requestId,
       directory,
       reply,
       message: response.behavior === "deny" ? response.message : undefined,
     });
+    if (result.error) throw new Error(toDiagnosticErrorMessage(result.error));
 
-    this.pendingPermissions.delete(requestId);
-    this.pendingPermissionDirectories.delete(requestId);
+    this.requestRevision += 1;
+    this.resolvePendingRequest(requestId, response);
   }
 
   describePersistence(): AgentPersistenceHandle | null {
@@ -4931,8 +5938,14 @@ class OpenCodeAgentSession implements AgentSession {
       nativeHandle: this.sessionId,
       metadata: {
         cwd: this.config.cwd,
+        ...(this.externalServer && this.serverUrl
+          ? { openCodeServerUrl: normalizeOpenCodeServerUrl(this.serverUrl) }
+          : {}),
         ...(this.config.modeId ? { modeId: this.config.modeId } : {}),
         ...(this.config.model ? { model: this.config.model } : {}),
+        ...(this.nativeSubmissions.size
+          ? { openCodeNativeSubmissions: this.getNativeSubmissions() }
+          : {}),
       },
     };
   }
@@ -4940,19 +5953,46 @@ class OpenCodeAgentSession implements AgentSession {
   async close(): Promise<void> {
     try {
       this.closed = true;
+      this.pendingTurnAdmission?.controller.abort(new Error("OpenCode session is closed"));
+      for (const controller of this.nativeRequestControllers)
+        controller.abort(new Error("OpenCode session is closed"));
       this.abortController?.abort();
       this.recoveryAbortController.abort();
       this.unsubscribeEvents?.();
       this.unsubscribeEvents = null;
+      this.observationAbort.abort();
+      this.cancelObservation?.();
+      this.cancelObservation = null;
+      this.replaceNativeHistory = null;
+      this.nativeRequestSubscribers.clear();
+      const eventStreamTask = this.eventStreamTask;
+      this.eventStreamAbortController?.abort();
+      if (eventStreamTask) {
+        await eventStreamTask.catch((error) => {
+          this.logger.debug(
+            { err: error, sessionId: this.sessionId },
+            "OpenCode event stream failed during close",
+          );
+        });
+      }
+      this.eventStreamAbortController = null;
+      this.eventStreamReady = null;
+      this.eventStreamTask = null;
       await this.ingress.catch(() => undefined);
+      await this.observationTask;
       this.subscribers.clear();
-      await abortOpenCodeSession({
-        client: this.client,
-        sessionId: this.sessionId,
-        directory: this.config.cwd,
-        logger: this.logger,
-      });
-      await this.deleteProviderSessionIfEphemeral();
+      // An external session's provider process outlives this adapter — a real terminal, or a
+      // successor adapter attaching to the same session, may still be using it. Closing our own
+      // observation must not abort or delete the session out from under them.
+      if (!this.externalServer) {
+        await abortOpenCodeSession({
+          client: this.client,
+          sessionId: this.sessionId,
+          directory: this.config.cwd,
+          logger: this.logger,
+        });
+        await this.deleteProviderSessionIfEphemeral();
+      }
       this.turnState = { status: "idle" };
     } finally {
       this.releaseBridge?.();
@@ -5002,6 +6042,7 @@ class OpenCodeAgentSession implements AgentSession {
 
   private async resolveSlashCommandInvocation(
     prompt: AgentPromptInput,
+    signal?: AbortSignal,
   ): Promise<{ commandName: string; args?: string } | null> {
     if (typeof prompt !== "string") {
       return null;
@@ -5011,9 +6052,11 @@ class OpenCodeAgentSession implements AgentSession {
       return null;
     }
     try {
-      const commands = await this.listCommands();
+      const commands = await listOpenCodeCommandsFromSdk(this.client, this.config.cwd, signal);
+      signal?.throwIfAborted();
       return commands.some((command) => command.name === parsed.commandName) ? parsed : null;
     } catch (error) {
+      signal?.throwIfAborted();
       this.logger.warn(
         { err: error, commandName: parsed.commandName },
         "Failed to resolve slash command; falling back to plain prompt input",
@@ -5033,7 +6076,8 @@ class OpenCodeAgentSession implements AgentSession {
     return { providerID: "opencode", modelID: model };
   }
 
-  private async ensureMcpServersConfigured(): Promise<void> {
+  private async ensureMcpServersConfigured(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (this.mcpConfigured) {
       return;
     }
@@ -5045,11 +6089,12 @@ class OpenCodeAgentSession implements AgentSession {
     }
 
     if (!this.mcpSetupPromise) {
-      this.mcpSetupPromise = this.configureMcpServers(mcpServers);
+      this.mcpSetupPromise = this.configureMcpServers(mcpServers, signal);
     }
 
     try {
       await this.mcpSetupPromise;
+      signal?.throwIfAborted();
       this.mcpConfigured = true;
     } catch (error) {
       this.mcpSetupPromise = null;
@@ -5057,21 +6102,32 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
-  private async configureMcpServers(mcpServers: Record<string, McpServerConfig>): Promise<void> {
+  private async configureMcpServers(
+    mcpServers: Record<string, McpServerConfig>,
+    signal?: AbortSignal,
+  ): Promise<void> {
     await Promise.all(
       Object.entries(mcpServers).map(([name, serverConfig]) =>
-        this.registerMcpServer(name, toOpenCodeMcpConfig(serverConfig)),
+        this.registerMcpServer(name, toOpenCodeMcpConfig(serverConfig), signal),
       ),
     );
   }
 
-  private async registerMcpServer(name: string, config: OpenCodeMcpConfig): Promise<void> {
+  private async registerMcpServer(
+    name: string,
+    config: OpenCodeMcpConfig,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted();
     await this.runMcpOperation("add", name, () =>
-      this.client.mcp.add({
-        directory: this.config.cwd,
-        name,
-        config,
-      }),
+      this.client.mcp.add(
+        {
+          directory: this.config.cwd,
+          name,
+          config,
+        },
+        { signal },
+      ),
     );
   }
 
@@ -5312,6 +6368,7 @@ class OpenCodeAgentSession implements AgentSession {
     for (const translatedEvent of translated) {
       this.recordProviderInternalEvent(translatedEvent);
       if (translatedEvent.type === "permission_requested") {
+        if (this.pendingPermissions.has(translatedEvent.request.id)) continue;
         const directory =
           (eventSessionId ? this.childSessionCwds.get(eventSessionId) : undefined) ??
           this.config.cwd;
@@ -5324,6 +6381,7 @@ class OpenCodeAgentSession implements AgentSession {
         }
         this.pendingPermissions.set(translatedEvent.request.id, translatedEvent.request);
         this.pendingPermissionDirectories.set(translatedEvent.request.id, directory);
+        this.publishNativeRequests();
       }
       if (translatedEvent.type === "turn_completed") {
         if (hasNormalizedOpenCodeUsage(this.accumulatedUsage)) {
@@ -5348,11 +6406,12 @@ class OpenCodeAgentSession implements AgentSession {
     }
 
     try {
-      await this.client.permission.reply({
+      const response = await this.client.permission.reply({
         requestID: request.id,
         directory,
         reply: "once",
       });
+      if (response.error) throw new Error(toDiagnosticErrorMessage(response.error));
       return true;
     } catch (error) {
       this.logger.warn(

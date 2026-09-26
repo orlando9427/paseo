@@ -48,6 +48,8 @@ export interface AgentTimelineFetchResult {
 }
 
 export interface AgentTimelineStore {
+  // The manager serializes all mutations per agent. Mutation promises resolve only after the
+  // actual commit/rollback settles; cancellation of a caller's wait is not write settlement.
   appendCommitted(
     agentId: string,
     item: AgentTimelineItem,
@@ -64,4 +66,12 @@ export interface AgentTimelineStore {
   deleteAgent(agentId: string): Promise<void>;
   bulkInsert(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void>;
   updateCommittedRow(agentId: string, row: AgentTimelineRow): Promise<void>;
+  /** Atomic replacement: call assertCurrent inside the transaction immediately before commit.
+   * A rejection leaves the previous rows intact; never implement as delete followed by inserts.
+   */
+  replaceCommitted(
+    agentId: string,
+    rows: readonly AgentTimelineRow[],
+    assertCurrent: () => void,
+  ): Promise<void>;
 }

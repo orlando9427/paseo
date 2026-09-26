@@ -43,6 +43,8 @@ import { KimiACPAgentClient } from "./providers/kimi-acp-agent.js";
 import { KiroACPAgentClient } from "./providers/kiro-acp-agent.js";
 import { OpenCodeAgentClient } from "./providers/opencode-agent.js";
 import type { OpenCodeBridge } from "./providers/opencode/bridge.js";
+import { supportsOpenCodeNativeHistory } from "./providers/opencode/native-history.js";
+import { supportsOpenCodeSubmissionTracking } from "./providers/opencode/native-submissions.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import type { OmpRuntime } from "./providers/omp/runtime.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
@@ -464,6 +466,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     },
     run: (prompt, options) => inner.run(prompt, options),
     startTurn: (prompt, options) => inner.startTurn(prompt, options),
+    readTurnTimeline: inner.readTurnTimeline?.bind(inner),
     subscribe: (callback) => inner.subscribe((event) => callback(mapStreamEvent(provider, event))),
     async *streamHistory() {
       for await (const event of inner.streamHistory()) {
@@ -487,10 +490,22 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     revertFiles: inner.revertFiles?.bind(inner),
     revertBoth: inner.revertBoth?.bind(inner),
     tryHandleOutOfBand: inner.tryHandleOutOfBand?.bind(inner),
+    ...(supportsOpenCodeNativeHistory(inner)
+      ? {
+          subscribeNativeHistory: inner.subscribeNativeHistory.bind(inner),
+          subscribeNativeRequests: inner.subscribeNativeRequests.bind(inner),
+        }
+      : {}),
+    ...(supportsOpenCodeSubmissionTracking(inner)
+      ? {
+          getNativeSubmissions: inner.getNativeSubmissions.bind(inner),
+          reconcileNativeSubmissions: inner.reconcileNativeSubmissions.bind(inner),
+        }
+      : {}),
   };
 }
 
-function wrapClientProvider(
+export function wrapClientProvider(
   provider: AgentProvider,
   inner: AgentClient,
   profileModels: ProviderProfileModel[],
@@ -504,6 +519,7 @@ function wrapClientProvider(
   return {
     provider,
     capabilities: inner.capabilities,
+    listExternalOpenCodeSessions: inner.listExternalOpenCodeSessions?.bind(inner),
     createSession: async (config, launchContext) =>
       wrapSessionProvider(
         provider,

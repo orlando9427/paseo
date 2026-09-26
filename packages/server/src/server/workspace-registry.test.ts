@@ -262,6 +262,87 @@ describe("workspace registries", () => {
     expect(await projectRegistry.get(archived.projectId)).toEqual(archived);
   });
 
+  test("a concurrent root refresh cannot undo an acknowledged archive", async () => {
+    const filePath = path.join(tmpDir, "projects", "projects.json");
+    projectRegistry = new FileBackedProjectRegistry(filePath, logger, {
+      projectIdFactory: () => "prj_replacement",
+    });
+    const original = createPersistedProjectRecord({
+      projectId: "prj_original",
+      rootPath: path.join(tmpDir, "root"),
+      kind: "non_git",
+      displayName: "Original",
+      customName: "Keep my name",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await projectRegistry.upsert(original);
+    const archivedAt = "2026-03-02T00:00:00.000Z";
+
+    // Both operations are outstanding together. The archive is enqueued first while its
+    // real atomic file write is in flight; the refresh must select from that commit.
+    const archive = projectRegistry.archive(original.projectId, archivedAt);
+    const refresh = projectRegistry.getOrCreateActiveByRoot({
+      rootPath: original.rootPath,
+      kind: "git",
+      displayName: "Detected name",
+      projectKey: "remote:new",
+      timestamp: "2026-03-03T00:00:00.000Z",
+    });
+    await archive;
+    const refreshed = await refresh;
+    const reopened = new FileBackedProjectRegistry(filePath, logger);
+    expect(await reopened.get(original.projectId)).toEqual({
+      ...original,
+      archivedAt,
+      updatedAt: archivedAt,
+    });
+    expect(refreshed.projectId).toBe("prj_replacement");
+    expect(await reopened.get(refreshed.projectId)).toEqual(refreshed);
+  });
+
+  test("a concurrent root refresh merges the latest committed user metadata", async () => {
+    const filePath = path.join(tmpDir, "projects", "projects.json");
+    const original = createPersistedProjectRecord({
+      projectId: "prj_original",
+      rootPath: path.join(tmpDir, "root"),
+      kind: "non_git",
+      displayName: "Original",
+      customName: "Old name",
+      customIconRevision: "icon-v1",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await projectRegistry.upsert(original);
+    const userUpdate = projectRegistry.update(original.projectId, (latest) => ({
+      ...latest,
+      customName: "Human choice",
+      customIconRevision: "icon-v2",
+      updatedAt: "2026-03-02T00:00:00.000Z",
+    }));
+    const refresh = projectRegistry.getOrCreateActiveByRoot({
+      rootPath: original.rootPath,
+      kind: "git",
+      displayName: "Must not replace the display name",
+      projectKey: "remote:new",
+      timestamp: "2026-03-03T00:00:00.000Z",
+    });
+    await userUpdate;
+    const refreshed = await refresh;
+    const expected = {
+      ...original,
+      kind: "git",
+      projectKey: "remote:new",
+      customName: "Human choice",
+      customIconRevision: "icon-v2",
+      updatedAt: "2026-03-03T00:00:00.000Z",
+    };
+    expect(refreshed).toEqual(expected);
+    expect(await new FileBackedProjectRegistry(filePath, logger).get(original.projectId)).toEqual(
+      expected,
+    );
+  });
+
   test("refreshes the oldest active legacy duplicate kind without rewriting its identity", async () => {
     await projectRegistry.initialize();
     const rootPath = path.join(tmpDir, "legacy-root");

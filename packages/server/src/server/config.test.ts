@@ -152,6 +152,49 @@ describe("server config", () => {
     expect(config.configReload?.overrideControlledPaths).toEqual(expected);
   });
 
+  test.each([
+    {
+      name: "retains a server URL-only override",
+      provider: { serverUrl: "http://127.0.0.1:4096" },
+      expected: { serverUrl: "http://127.0.0.1:4096" },
+    },
+    {
+      name: "preserves a server URL with environment and command overrides",
+      provider: {
+        serverUrl: "http://127.0.0.1:4096",
+        env: { OPENCODE_API_KEY: "fake-api-key" },
+        command: ["opencode", "--fake-flag"],
+      },
+      expected: {
+        serverUrl: "http://127.0.0.1:4096",
+        env: { OPENCODE_API_KEY: "fake-api-key" },
+        command: { mode: "replace", argv: ["opencode", "--fake-flag"] },
+      },
+    },
+    {
+      name: "normalizes a legacy replace command while preserving the server URL",
+      provider: {
+        serverUrl: "http://127.0.0.1:4096",
+        command: { mode: "replace", argv: ["opencode", "--legacy-flag"] },
+      },
+      expected: {
+        serverUrl: "http://127.0.0.1:4096",
+        command: { mode: "replace", argv: ["opencode", "--legacy-flag"] },
+      },
+    },
+  ])("$name", async ({ provider, expected }) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-server-config-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ agents: { providers: { opencode: provider } } }),
+    );
+
+    const config = loadConfig(paseoHome, { env: {} });
+
+    expect(config.agentProviderSettings?.opencode).toMatchObject(expected);
+  });
+
   test("resolves bundled web UI path from source-tree modules", () => {
     const root = path.parse(process.cwd()).root;
     expect(

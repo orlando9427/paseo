@@ -20,6 +20,7 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { getParentAgentIdFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { createRealpathAwarePathMatcher } from "../../utils/path.js";
+import { externalOpenCodeSessionKey } from "./external-opencode-types.js";
 
 type ImportAgentRequestMessage = z.infer<typeof ImportAgentRequestMessageSchema>;
 
@@ -27,6 +28,7 @@ const METADATA_GENERATION_PROMPT_PREFIX =
   "Generate metadata for a coding agent based on the user prompt.";
 const IMPORT_SESSION_SEARCH_SCAN_LIMIT = 500;
 export type ImportSessionAgentManager = AgentLoaderManager &
+  Partial<Pick<AgentManager, "getExternalOpenCodeEndpoint">> &
   Pick<
     AgentManager,
     | "archiveSnapshot"
@@ -63,7 +65,8 @@ export class ImportSessionsRequestError extends Error {
 
 export interface ListImportableProviderSessionsInput {
   request: FetchRecentProviderSessionsRequestMessage;
-  agentManager: Pick<AgentManager, "listAgents" | "listImportableSessions">;
+  agentManager: Pick<AgentManager, "listAgents" | "listImportableSessions"> &
+    Partial<Pick<AgentManager, "getExternalOpenCodeEndpoint">>;
   agentStorage: Pick<AgentStorage, "list">;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "getProviderLabel">;
 }
@@ -153,7 +156,15 @@ export async function listImportableProviderSessions(
       continue;
     }
     if (
-      importedHandles.has(toProviderSessionHandleKey(session.provider, session.providerHandleId))
+      importedHandles.has(
+        toProviderSessionHandleKey(
+          session.provider,
+          session.providerHandleId,
+          session.provider === "opencode"
+            ? agentManager.getExternalOpenCodeEndpoint?.()
+            : undefined,
+        ),
+      )
     ) {
       filteredAlreadyImportedCount += 1;
       continue;
@@ -189,14 +200,29 @@ export async function importProviderSession(
   if (!cwd) {
     throw new Error("Import requires cwd from the selected provider session");
   }
-  const key = await resolveProviderSessionImportMutationKey(input);
-  return serializeProviderSessionImport(input.agentManager, key, async () => {
+  const endpoint =
+    input.request.provider === "opencode"
+      ? input.agentManager.getExternalOpenCodeEndpoint?.()
+      : undefined;
+  const operation = async () => {
+    const records = await input.agentStorage.listByProviderSession(
+      input.request.provider,
+      input.request.providerHandleId,
+      endpoint,
+    );
+    if (records.some((record) => !record.archivedAt)) {
+      throw new Error(`Provider session is already imported: ${input.request.providerHandleId}`);
+    }
     const placement = await input.workspaceProvisioning.runInImportWorkspace(
       { cwd, requestedWorkspaceId: input.request.workspaceId },
       (workspace) => importProviderSessionNow(input, cwd, workspace.workspaceId),
     );
     return { ...placement.value, createdWorkspace: placement.createdWorkspace };
-  });
+  };
+  if (endpoint)
+    return input.agentStorage.serializeProviderSessionMutation("external-opencode", operation);
+  const key = await resolveProviderSessionImportMutationKey(input);
+  return serializeProviderSessionImport(input.agentManager, key, operation);
 }
 
 async function importProviderSessionNow(
@@ -209,6 +235,7 @@ async function importProviderSessionNow(
   const matchingRecords = await input.agentStorage.listByProviderSession(
     provider,
     providerHandleId,
+    provider === "opencode" ? input.agentManager.getExternalOpenCodeEndpoint?.() : undefined,
   );
   const activeRecord = matchingRecords.find((record) => !record.archivedAt);
   if (activeRecord) {
@@ -376,7 +403,13 @@ async function collectImportedProviderSessions(
   return { handles, count: sessions.size };
 }
 
-function toProviderSessionHandleKey(provider: string, providerHandleId: string): string {
+function toProviderSessionHandleKey(
+  provider: string,
+  providerHandleId: string,
+  endpoint?: string,
+): string {
+  if (provider === "opencode" && endpoint)
+    return `${provider}\0${externalOpenCodeSessionKey(endpoint, providerHandleId)}`;
   return `${provider}\0${providerHandleId}`;
 }
 
@@ -395,8 +428,12 @@ function collectProviderSessionHandleKeys(
     return;
   }
 
-  target.add(toProviderSessionHandleKey(provider, persistence.sessionId));
+  const endpoint =
+    provider === "opencode" && typeof persistence.metadata?.openCodeServerUrl === "string"
+      ? persistence.metadata.openCodeServerUrl
+      : undefined;
+  target.add(toProviderSessionHandleKey(provider, persistence.sessionId, endpoint));
   if (persistence.nativeHandle) {
-    target.add(toProviderSessionHandleKey(provider, persistence.nativeHandle));
+    target.add(toProviderSessionHandleKey(provider, persistence.nativeHandle, endpoint));
   }
 }

@@ -579,6 +579,80 @@ test("normalizeImportAgentRequest accepts new and legacy import handle shapes", 
   });
 });
 
+test("external native catalog deduplication uses normalized endpoint plus native ID", async () => {
+  const native = makeImportableSession({
+    provider: "opencode",
+    sessionId: "same-id",
+    lastActivityAt: "2026-09-12T10:00:00Z",
+  });
+  const stored: StoredAgentRecord = {
+    id: "paseo-owner",
+    provider: "opencode",
+    cwd: native.cwd,
+    createdAt: "2026-09-12T10:00:00Z",
+    updatedAt: "2026-09-12T10:00:00Z",
+    labels: {},
+    lastStatus: "closed",
+    persistence: {
+      provider: "opencode",
+      sessionId: "same-id",
+      metadata: { openCodeServerUrl: "http://server-a/" },
+    },
+  };
+  async function list(endpoint: string) {
+    return listImportableProviderSessions({
+      request: makeRequest({ providers: ["opencode"] }),
+      agentManager: {
+        listAgents: () => [],
+        listImportableSessions: async () => [native],
+        getExternalOpenCodeEndpoint: () => endpoint,
+      },
+      agentStorage: { list: async () => [stored] },
+      providerSnapshotManager: { getProviderLabel: () => "OpenCode" },
+    });
+  }
+  expect((await list("http://server-a:80")).entries).toEqual([]);
+  expect((await list("http://server-b")).entries).toHaveLength(1);
+});
+
+test("active external imports are rejected before allocating a workspace", async () => {
+  const harness = await ProviderImportHarness.create();
+  const record = makeStoredProviderSession({
+    id: "existing",
+    cwd: "/tmp/project",
+    sessionId: "native",
+    archivedAt: null,
+  });
+  await harness.seed({
+    ...record,
+    provider: "opencode",
+    persistence: {
+      provider: "opencode",
+      sessionId: "native",
+      metadata: { openCodeServerUrl: "http://server-a" },
+    },
+  });
+  await expect(
+    importProviderSession({
+      request: {
+        provider: "opencode",
+        providerHandleId: "native",
+        cwd: record.cwd,
+        requestId: "request",
+      },
+      agentManager: { ...harness.manager, getExternalOpenCodeEndpoint: () => "http://server-a/" },
+      agentStorage: harness.storage,
+      logger: createTestLogger(),
+      workspaceProvisioning: {
+        runInImportWorkspace: async () => {
+          throw new Error("Workspace must not be allocated");
+        },
+      },
+    }),
+  ).rejects.toThrow("Provider session is already imported");
+  expect(harness.freshImports).toEqual([]);
+});
+
 function makeStoredProviderSession(input: {
   id: string;
   cwd: string;

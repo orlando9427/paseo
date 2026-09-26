@@ -9,6 +9,7 @@ import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
+import { externalOpenCodeSessionKey } from "./external-opencode-types.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -99,6 +100,7 @@ export class AgentStorage {
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
+  private providerSessionMutations = new Map<string, Promise<unknown>>();
   private deleting: Set<string> = new Set();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
@@ -129,14 +131,33 @@ export class AgentStorage {
   async listByProviderSession(
     provider: string,
     providerHandleId: string,
+    endpoint?: string,
   ): Promise<StoredAgentRecord[]> {
     await this.load();
     return Array.from(this.cache.values()).filter(
       (record) =>
         record.persistence?.provider === provider &&
+        (endpoint === undefined ||
+          (typeof record.persistence.metadata?.openCodeServerUrl === "string" &&
+            externalOpenCodeSessionKey(
+              record.persistence.metadata.openCodeServerUrl,
+              providerHandleId,
+            ) === externalOpenCodeSessionKey(endpoint, providerHandleId))) &&
         (record.persistence.sessionId === providerHandleId ||
           record.persistence.nativeHandle === providerHandleId),
     );
+  }
+
+  async serializeProviderSessionMutation<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.providerSessionMutations.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    this.providerSessionMutations.set(key, next);
+    try {
+      return await next;
+    } finally {
+      if (this.providerSessionMutations.get(key) === next)
+        this.providerSessionMutations.delete(key);
+    }
   }
 
   async listByWorkspace(workspaceId: string): Promise<StoredAgentRecord[]> {

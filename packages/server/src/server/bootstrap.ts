@@ -567,6 +567,10 @@ function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDae
   return initialConfig;
 }
 
+function resolveExternalOpenCodeEndpoint(config: PaseoDaemonConfig): string | undefined {
+  return config.agentProviderSettings?.opencode?.serverUrl;
+}
+
 export async function createPaseoDaemon(
   config: PaseoDaemonConfig,
   rootLogger: Logger,
@@ -924,6 +928,7 @@ export async function createPaseoDaemon(
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
+    externalOpenCodeEndpoint: resolveExternalOpenCodeEndpoint(config),
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,

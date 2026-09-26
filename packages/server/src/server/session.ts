@@ -1192,6 +1192,12 @@ export class Session {
       () => this.refreshObservationProducers(),
     );
 
+    // A session constructed with no source attached yet (a bare `onMessage`-only session, or a
+    // brand-new socket before its first `updateClientCapabilities`) still needs its initial
+    // demand computed once, so `isImplicitLegacySession()` sessions start observing immediately
+    // instead of only reacting to a later attach/subscribe call.
+    this.refreshObservationProducers();
+
     this.sessionLogger.trace({}, "agent.session.lifecycle.created");
   }
 
@@ -1607,8 +1613,18 @@ export class Session {
   /**
    * Subscribe to AgentManager events and forward them to the client
    */
+  // A session with no attached sources at all, and no per-source routing callback, behaves
+  // like a single always-on legacy channel: broadcasts flow straight to `onMessage` (matches
+  // the `clientSources.size === 0 || !this.onMessageToSource` fallback used elsewhere in this
+  // file), so treat it as legacy for demand purposes even before `this.delivery` sees a source.
+  private isImplicitLegacySession(): boolean {
+    return (
+      this.delivery.hasLegacySources() || this.clientSources.size === 0 || !this.onMessageToSource
+    );
+  }
+
   private refreshObservationProducers(): void {
-    const legacy = this.delivery.hasLegacySources();
+    const legacy = this.isImplicitLegacySession();
     const workspaces =
       legacy || this.delivery.hasDemand("workspaces") || this.wantsEvent("checkout_status_update");
     const agents =
@@ -1895,6 +1911,10 @@ export class Session {
           return;
         }
 
+        if (event.type === "agent_timeline_reset") {
+          this.forwardNativeTimeline(event.agentId);
+          return;
+        }
         if (event.type === "agent_state") {
           this.sessionLogger.trace(
             {
@@ -1998,6 +2018,84 @@ export class Session {
         "Failed to emit provider subagent workspace update",
       );
     });
+  }
+
+  private forwardNativeTimeline(agentId: string): void {
+    // A native history commit replaces the timeline wholesale. Push a fresh bounded tail page
+    // directly (mirroring handleFetchAgentTimelineRequest) instead of waiting for the client to
+    // notice and re-request — a native reset has no other signal a modern client would act on.
+    const agent = this.agentManager.getAgent(agentId);
+    if (!agent) return;
+    const controlTimeline = this.agentManager.fetchTimeline(agentId, {
+      direction: "tail",
+      limit: 200,
+    });
+    const epoch = controlTimeline.epoch;
+    const buildMessage = (source?: object): SessionOutboundMessage => {
+      const reasoningMerge = source
+        ? this.supportsForSource(CLIENT_CAPS.reasoningMergeEnum, source)
+        : this.supports(CLIENT_CAPS.reasoningMergeEnum);
+      const entries = controlTimeline.rows.filter((row) =>
+        this.supportsTimelineItem(row.item, source),
+      );
+      return {
+        type: "fetch_agent_timeline_response",
+        payload: {
+          requestId: `native-history:${epoch}`,
+          agentId,
+          agent: null,
+          direction: "tail",
+          projection: "projected",
+          epoch,
+          reset: true,
+          staleCursor: false,
+          gap: false,
+          window: controlTimeline.window,
+          startCursor:
+            controlTimeline.startSeq === null ? null : { epoch, seq: controlTimeline.startSeq },
+          endCursor:
+            controlTimeline.endSeq === null ? null : { epoch, seq: controlTimeline.endSeq },
+          hasOlder: controlTimeline.hasOlder,
+          hasNewer: controlTimeline.hasNewer,
+          entries: entries.map((entry) => ({
+            item: entry.item,
+            timestamp: entry.timestamp,
+            seqStart: entry.seqStart,
+            seqEnd: entry.seqEnd,
+            sourceSeqRanges: entry.sourceSeqRanges,
+            provider: agent.provider,
+            collapsed: reasoningMerge
+              ? entry.collapsed
+              : entry.collapsed.filter((value) => value !== "reasoning_merge"),
+          })),
+          error: null,
+        },
+      };
+    };
+    let deliveredToAnySubscription = false;
+    for (const subscription of this.timelineSubscriptions.values()) {
+      if (!subscription.agentIds.has(agentId)) continue;
+      deliveredToAnySubscription = true;
+      subscription.owner.emit(buildMessage(subscription.owner.source));
+    }
+    if (this.clientSources.size === 0 || !this.onMessageToSource) {
+      // No per-source routing: this session's own capability decides whether an unsolicited
+      // push is welcome, matching a selective client that must opt in via an explicit
+      // subscription (already handled by the loop above) before it receives anything.
+      if (!deliveredToAnySubscription && !this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
+        this.emit(buildMessage());
+      }
+      return;
+    }
+    // COMPAT(ownedSubscriptions): added in v0.8.0, remove implicit timeline delivery after 2027-03-09.
+    for (const [source, { capabilities }] of this.clientSources) {
+      if (capabilities.has(CLIENT_CAPS.selectiveAgentTimeline)) continue;
+      const alreadyDelivered = [...this.timelineSubscriptions.values()].some(
+        (subscription) =>
+          subscription.owner.source === source && subscription.agentIds.has(agentId),
+      );
+      if (!alreadyDelivered) this.onMessageToSource(source, buildMessage(source));
+    }
   }
 
   private buildAgentStreamPayload(
@@ -8068,11 +8166,14 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
+          fallbackMessageId: msg.requestId,
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           clearPendingPermissions: true,
           logger: this.sessionLogger,
         });
-        if (result.disposition === "turn_started") {
+        // An externally-owned session may already be accepted/queued by the time
+        // sendPromptToAgent returns — there is no local turn start to wait for.
+        if (result.disposition === "turn_started" && !result.accepted && !result.queued) {
           await waitForAgentRunStartWithTimeout(
             this.agentManager,
             agentId,
@@ -8256,7 +8357,7 @@ export class Session {
       return [...this.clientSources.keys()].some((candidate) => this.wantsEvent(event, candidate));
     }
     if (source && this.delivery.isModern(source)) return false;
-    if (!source && !this.delivery.hasLegacySources()) return false;
+    if (!source && !this.isImplicitLegacySession()) return false;
     // COMPAT(ownedSubscriptions): added in v0.8.0, remove implicit event delivery after 2027-03-09.
     const capabilities = source
       ? (this.clientSources.get(source)?.capabilities ?? this.clientCapabilities)

@@ -1530,8 +1530,9 @@ describe("OpenCode adapter startTurn error handling", () => {
       global: {
         event: vi.fn().mockResolvedValue({
           stream: (async function* () {
+            yield globalEvents[0];
             await eventsGate.promise;
-            yield* globalEvents;
+            yield* globalEvents.slice(1);
           })(),
         }),
       },
@@ -1640,8 +1641,9 @@ describe("OpenCode adapter startTurn error handling", () => {
       global: {
         event: vi.fn().mockResolvedValue({
           stream: (async function* () {
+            yield globalEvents[0];
             await eventsGate.promise;
-            yield* globalEvents;
+            yield* globalEvents.slice(1);
           })(),
         }),
       },
@@ -1683,8 +1685,13 @@ describe("OpenCode adapter startTurn error handling", () => {
     const retryStream: AsyncIterable<unknown> = {
       [Symbol.asyncIterator]: () => {
         let emitted = false;
+        let connected = false;
         return {
           next: async () => {
+            if (!connected) {
+              connected = true;
+              return { done: false, value: { type: "server.connected", properties: {} } };
+            }
             await eventsGate.promise;
             if (!emitted) {
               emitted = true;
@@ -2820,7 +2827,7 @@ describe("OpenCode adapter startTurn error handling", () => {
     }
   });
 
-  test("keeps a waiting replacement behind an abort issued while it waits", async () => {
+  test("revokes a waiting replacement when another Stop arrives", async () => {
     const { parent: session, openCode } = await createParentSession("ses_stop_during_wait");
     const settleFirstAbort = createTestDeferred<void>();
     const settleSecondAbort = createTestDeferred<void>();
@@ -2840,6 +2847,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(1));
 
       replacement = session.startTurn("replacement");
+      const cancelled = expect(replacement).rejects.toThrow("admission interrupted");
       openCode.emitEvent({
         type: "session.idle",
         properties: { sessionID: "ses_stop_during_wait" },
@@ -2847,6 +2855,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       const secondStop = session.interrupt();
       void secondStop.catch(() => undefined);
+      await cancelled;
       await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(2));
 
       settleFirstAbort.resolve();
@@ -2856,7 +2865,8 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       settleSecondAbort.resolve();
       await secondStop;
-      await replacement;
+      expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
+      await session.startTurn("fresh request after Stop");
       expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
     } finally {
       settleFirstAbort.resolve();
@@ -4422,8 +4432,7 @@ describe("OpenCode provider subagent contract", () => {
         },
       },
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const child = await client.resumeSession(
       {
@@ -4493,8 +4502,7 @@ describe("OpenCode provider subagent contract", () => {
         },
       },
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const child = await client.resumeSession(
       {
