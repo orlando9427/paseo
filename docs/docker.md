@@ -205,6 +205,32 @@ docker build \
   .
 ```
 
+For a personal fork on a VPS, build from your own branch instead of pulling the published image:
+
+```bash
+git clone <your-fork-url> paseo && cd paseo
+git checkout mis-cambios   # or whatever branch you deploy from
+
+docker build -f docker/base/Dockerfile -t paseo:local .
+
+cp docker/docker-compose.example.yml docker-compose.yml
+```
+
+Edit `docker-compose.yml` so `image:` points at your local tag instead of the published one, keeping the rest (ports, volumes, `PASEO_PASSWORD`) as in the [Docker Compose](#docker-compose) example above:
+
+```yaml
+services:
+  paseo:
+    image: paseo:local
+```
+
+```bash
+docker compose up -d
+docker compose logs -f paseo   # confirm it started clean
+```
+
+To ship a new commit: `git pull`, rebuild the image (`docker build -f docker/base/Dockerfile -t paseo:local .`), then `docker compose up -d` again — Compose recreates the container when the tag's underlying image ID changed. Your `paseo-home` and `workspace` volumes persist across rebuilds, so state and agent credentials survive.
+
 The Docker workflow builds the image on pull requests and on `main` as a
 non-publishing check. Stable `vX.Y.Z` tag pushes publish
 `ghcr.io/getpaseo/paseo:X.Y.Z` and `ghcr.io/getpaseo/paseo:latest`. Beta tags

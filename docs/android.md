@@ -59,6 +59,30 @@ emulator @paseo     # start it; leave running
 
 Gradle auto-fetches the platform/build-tools it needs once licenses are accepted, so adjust `android-35` only if it asks for a different level.
 
+### If `mise.run` or `*.jdx.dev` are unreachable
+
+Some networks block the Cloudflare-fronted `jdx.dev` subdomains outright (DNS resolves, the TCP handshake just hangs) — `mise install`'s own `mise.run` bootstrap and its Java/Android plugins both depend on them, with no working alternate mirror. Skip mise entirely for Java and the Android SDK in that case:
+
+```bash
+sudo apt-get install -y openjdk-21-jdk   # or your platform's package manager
+```
+
+Android's cmdline-tools come straight from `dl.google.com`, unaffected by a `jdx.dev` block:
+
+```bash
+curl -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+mkdir -p ~/android-sdk/cmdline-tools
+unzip /tmp/cmdline-tools.zip -d ~/android-sdk/cmdline-tools
+mv ~/android-sdk/cmdline-tools/cmdline-tools ~/android-sdk/cmdline-tools/latest
+
+export ANDROID_HOME="$HOME/android-sdk" ANDROID_SDK_ROOT="$HOME/android-sdk"
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+yes | sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+```
+
+The download path is `/android/repository/`, not `/android/repo/` — the latter 404s. Check `https://dl.google.com/android/repository/repository2-1.xml` for the current `commandlinetools-linux-*_latest.zip` name if this one has aged out.
+
 ## Local build + install
 
 From repo root:
@@ -94,6 +118,41 @@ npx cross-env APP_VARIANT=production expo run:android --variant=release
 # Clear generated Android project
 rm -rf android
 ```
+
+`npm run android:production` only runs `build:client` before prebuild, not a full workspace build. A package with its own native-module build step — `@getpaseo/expo-two-way-audio` compiles via `tsc` into `build/` — can be silently unbuilt, and the release Gradle build then fails late, inside `createBundleReleaseJsAndAssets`, with an unresolved `main` field. Run `npm run build --workspaces --if-present` (or `npm run build --workspace=<package>` for just the one) before prebuild if you hit that.
+
+`expo run:android --variant=release` requires a connected device or running emulator and fails immediately without one. To produce the release APK with neither, run Gradle directly against the generated project instead:
+
+```bash
+cd packages/app/android
+./gradlew :app:assembleRelease -x lint -x lintVitalAnalyzeRelease -x lintVitalRelease -x generateReleaseLintModel -x generateReleaseLintVitalModel
+```
+
+This is the same Gradle command `eas.json`'s `production-apk` profile uses. `android/app/build.gradle`'s `release` build type signs with `signingConfigs.debug` (the same `debug.keystore` as the `debug` build type) unless you configure a real release keystore, so this produces an installable APK with no interactive signing step — unlike an EAS cloud build, which prompts to generate a keystore on first run. The APK lands at `android/app/build/outputs/apk/release/app-release.apk`.
+
+Installing over an existing build signed with a different key (for example the Play Store release) fails with a signature mismatch (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). Uninstall the other build first.
+
+Any Linux host with the prerequisites above works the same way over SSH — clone the branch, install Node/Java/the SDK, then run the same `npm install`, `npm run build --workspaces --if-present`, `expo prebuild`, and `gradlew :app:assembleRelease` steps. Run the Gradle step inside `tmux` or `screen` so it survives a disconnect. Copy the finished APK back with `scp`.
+
+Native compilation (CMake for Reanimated, Skia, gesture-handler, and friends) is the slowest and heaviest part — it is the reason EAS's `production-apk` profile requires the `large` resource class, and by default it builds all four ABIs (`armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64`) in parallel with Gradle workers scaled to CPU count. On a machine with many cores but limited RAM (WSL2 in particular, where the VM's memory ceiling is a fraction of the host's), this can spike hard enough to crash the VM outright rather than fail gracefully. If you only need the APK for one device, cut both dimensions of that parallelism:
+
+```bash
+./gradlew :app:assembleRelease \
+  -PreactNativeArchitectures=arm64-v8a \
+  --max-workers=6 \
+  -x lint -x lintVitalAnalyzeRelease -x lintVitalRelease -x generateReleaseLintModel -x generateReleaseLintVitalModel
+```
+
+`-PreactNativeArchitectures` overrides `gradle.properties`' `reactNativeArchitectures` for one build, cutting native-compile work roughly 4x. `--max-workers` caps Gradle's own task concurrency (default is CPU count, which on a 16-core box means 16 concurrent compiler/Kotlin/CMake processes). Metro's bundler workers are a separate pool and don't follow either flag; cap them with `PASEO_METRO_MAX_WORKERS=<n>` (read by `packages/app/metro.config.cjs`), unset by default so normal builds and CI are unaffected. On WSL2, also raise the VM's own memory ceiling — it defaults to 50% of host RAM — via `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=20GB
+swap=8GB
+vmIdleTimeout=-1
+```
+
+`vmIdleTimeout=-1` matters independently of the RAM sizing: WSL2 shuts the whole VM down (killing background builds, `nohup` included) after its default ~1 minute of no connected client, which can look identical to an OOM crash if a terminal window closes mid-build. Changes to `.wslconfig` only take effect on the next `wsl --shutdown` + restart, so make them before a long build, not during one.
 
 ## Running on an emulator against a worktree daemon
 
@@ -200,6 +259,12 @@ adb exec-out screencap -p > screenshot.png
 ```
 
 ## Cloud build + submit (EAS)
+
+### Building under your own account (personal forks)
+
+`packages/app/app.config.js`'s `extra.eas.projectId` and `owner` point at Paseo's own EAS project. `eas build` on a fork without access to that project fails with "Entity Not Authorized". To build under your own account: remove both fields, run `eas init --force` (it prompts for which account when you belong to more than one), then add the printed `projectId` and your account name back into `app.config.js` yourself — dynamic (`.js`) config isn't rewritten automatically the way static `app.json` is. Keep this change local; committing your personal `projectId`/`owner` over Paseo's breaks EAS builds for everyone else on the branch.
+
+The `production`/`production-apk` profiles set `resourceClass: "large"` in `eas.json`, which needs a paid EAS plan (Production/Enterprise/On-Demand) — see the note on why in [F-Droid / source-only Android builds](#f-droid--source-only-android-builds) below. A free personal account hits this paywall before it hits a Hermes OOM; use the [local build](#local-build--install) instead if you don't want to pay for it.
 
 Stable tag pushes like `v0.1.0` trigger:
 
